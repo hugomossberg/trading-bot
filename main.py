@@ -1,6 +1,8 @@
 import json
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+from chatgpt_client import chat_gpt
 
 reminders = []
 def save_reminders():
@@ -15,7 +17,6 @@ def load_reminders():
             reminders = json.load(f)
     except FileNotFoundError:
         reminders = []
-
 
 async def Start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Hej! Jag är din bot.")
@@ -41,14 +42,11 @@ async def delete_reminds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reminders.clear()
     await update.message.reply_text("påminnelser raderade ")
 
-#gpt key#
-# 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 #
-
-
-
-
-
-
+async def chat_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Svara på alla meddelanden med ChatGPT"""
+    user_message = update.message.text  # Hämta användarens textmeddelande
+    response = chat_gpt(user_message)  # Skicka till OpenAI API
+    await update.message.reply_text(response)  # Skicka tillbaka svaret till chatten
 
     
 
@@ -62,8 +60,10 @@ def main():
     app.add_handler(CommandHandler("start", Start))
     app.add_handler(CommandHandler("remind", add_remind))
     app.add_handler(CommandHandler("list", display_reminds))
+
+
     
-    
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_response))
     app.run_polling()
 
 if __name__ == "__main__":
