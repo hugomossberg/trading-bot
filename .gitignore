@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtuella miljöer
+venv/
+.env/
+*.venv
+
+# Loggfiler och temporära filer
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS-specifika filer
+.DS_Store
+Thumbs.db
+
+# IDE/editor-filer
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Konfigurationsfiler som kan innehålla känslig information
+config.json
+.env
+secrets.json
+
+# Git-filer
+*.bak
