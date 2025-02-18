@@ -12,7 +12,7 @@ def chat_gpt(user_message):
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "Du är en hjälpsam AI-assistent."},
+                {"role": "system", "content": "Jag är en noggran ai som gillar detaljer"},
                 {"role": "user", "content": user_message}
             ]
         )

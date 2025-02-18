@@ -21,19 +21,10 @@ async def chat_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 
-async def stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) == 0:
-        await update.message.reply_text("Använd: /stock <TICKER>")
-        return
-
-    ticker = context.args[0].upper()
-    stock = yf.Ticker(ticker)
-
-    try:
-        price = stock.history(period="1d")["Close"].iloc[-1]
-        await update.message.reply_text(f"Senaste pris för {ticker}: {price:.2f} USD")
-    except IndexError:
-        await update.message.reply_text("Kunde inte hämta data, kontrollera att du angav rätt ticker.")
+async def user_ask_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_message = update.message.text
+    ai_respons = chat_gpt(f"Ge mig en analys i JSON-format: {user_message}")
+    
 
     
 
@@ -42,7 +33,7 @@ def main():
  
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("stock", stock_price))
+
 
 
 
