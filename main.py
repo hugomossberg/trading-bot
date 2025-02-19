@@ -1,4 +1,5 @@
 import json
+import requests
 import os
 from dotenv import load_dotenv
 from telegram import Update
@@ -9,23 +10,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-import yfinance as yf
+
 from chatgpt_client import chat_gpt
-from ib_insync import *
-
-ib = IB()
-ib.connect("127.0.0.1", 4002, clientId=1)
+from ibkr_client import IbClient
 
 
-print(ib.accountValues())
-
-contract = Stock("NVDA", "SMART", "USD")
-ib.qualifyContracts(contract)
-ticker = ib.reqMktData(contract)
-ib.sleep(2)  # Vänta lite så att data hinner laddas
-print(ticker.last)
-
-ib.disconnect()
 load_dotenv()
 
 
@@ -39,16 +28,20 @@ async def chat_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(response)  # Skicka tillbaka svaret till chatten
 
 
-async def user_ask_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_message = update.message.text
-    ai_respons = chat_gpt(f"Ge mig en analys i JSON-format: {user_message}")
-
-
 def main():
-
+    # telegram
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # IBKR
+    ib_client = IbClient()
+    ib_client.get_stock()
+
+    # openapi
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_response))
+
+    # disconnect IBKR API
+    ib_client.disconnect_ibkr()
+
     app.run_polling()
 
 
