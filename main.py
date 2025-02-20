@@ -11,6 +11,7 @@ from telegram.ext import (
     filters,
 )
 from yfinance_stock import analyse_stock
+
 import nest_asyncio
 
 load_dotenv()
@@ -36,7 +37,7 @@ async def ask_ai_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_message = update.message.text
     if user_message:
         await update.message.reply_text(f"Hämtar aktier med ticker {user_message}...")
-        tickers = await ib_client.get_stocks()
+        tickers = await analyse_stock(ib_client)
         if tickers:
             await update.message.reply_text(
                 f"Hämtade {len(tickers)} aktier: {', '.join(tickers)}"
@@ -61,7 +62,7 @@ async def main():
     await ib_client.connect()
 
     # Skicka in den redan anslutna IbClient-instansen
-    analyzed_stocks = await analyse_stock(ib_client)
+    await analyse_stock(ib_client)
     # Du kan bearbeta analyzed_stocks vidare om du vill
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
