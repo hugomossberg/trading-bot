@@ -1,9 +1,6 @@
 # yfinance_stock.py
 import yfinance as yf
-import asyncio
 import json
-import time
-
 
 async def analyse_stock(ib_client):
     tickers = await ib_client.get_stocks()  # Hämtar aktielistan

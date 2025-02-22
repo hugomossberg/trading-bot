@@ -1,7 +1,5 @@
 # main.py
-import re
 import os
-import json
 import asyncio
 from dotenv import load_dotenv
 from telegram import Update
@@ -12,7 +10,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from yfinance_stock import analyse_stock
 
 import nest_asyncio
 
@@ -38,23 +35,26 @@ async def disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def main():
     global ib_client
     from ibkr_client import IbClient
-    from chatgpt_client import chat_gpt, chat_response, ask_ai_stock
-
+    from chatgpt_client import OpenAi
+    from yfinance_stock import analyse_stock
+    
+ 
     # Lokal import för att undvika cirkulära beroenden
-
+    open_ai = OpenAi()
     ib_client = IbClient()
+    
     await ib_client.connect()
-
+    
     # Skicka in den redan anslutna IbClient-instansen
     await analyse_stock(ib_client)
     # Du kan bearbeta analyzed_stocks vidare om du vill
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_response))
-    app.add_handler(MessageHandler(filters.ALL, ask_ai_stock))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_ai.chat_response))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_ai.ask_ai_stock))
 
     app.add_handler(CommandHandler("dc", disconnect_command))
-
+    
     await app.run_polling()
     await ib_client.disconnect_ibkr()
 
