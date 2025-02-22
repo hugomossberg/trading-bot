@@ -25,7 +25,7 @@ class OpenAi:
         try:
             client = openai.OpenAI(api_key = self.api_key)  # Ange API-nyckeln här
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo",  # gpt-3.5-turbo
+                model="gpt-4o-2024-08-06",  # gpt-3.5-turbo
                 messages=[
                     {
                         "role": "system",
@@ -80,6 +80,6 @@ class OpenAi:
         # Om aktien inte hittades, fråga ChatGPT istället
         try:
             response = await self.chat_gpt(update.message.text)
-            await update.message.reply_text(f"ChatGPT-svar: {response}")
+            await update.message.reply_text(response)
         except Exception as e:
             await update.message.reply_text(f"Ett fel uppstod: {str(e)}")

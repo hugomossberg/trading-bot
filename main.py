@@ -48,12 +48,12 @@ async def main():
     # Skicka in den redan anslutna IbClient-instansen
     await analyse_stock(ib_client)
     # Du kan bearbeta analyzed_stocks vidare om du vill
-
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_ai.chat_response))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_ai.ask_ai_stock))
-
     app.add_handler(CommandHandler("dc", disconnect_command))
+    app.add_handler(MessageHandler(filters.ALL, open_ai.ask_ai_stock))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, open_ai.chat_response))
+
+ 
     
     await app.run_polling()
     await ib_client.disconnect_ibkr()
