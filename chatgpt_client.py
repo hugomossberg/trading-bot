@@ -71,6 +71,7 @@ class OpenAi:
                 print(f"✅ Match hittad för: {stock['symbol']}")
                 await update.message.reply_text(f"Aktieinfo för {stock['name']}:")
                 await update.message.reply_text(f"Latest Close: {stock['latestClose']}")
+                await update.message.reply_text(f"P/E: {stock['PE']}")
                 
             
                 news_list = stock.get("News")
@@ -84,6 +85,7 @@ class OpenAi:
                 await update.message.reply_text(f"Sektor: {stock.get('sector', 'okänd')}")
                 return
         print(f"❌ Aktie med symbolen {symbol} hittades INTE i JSON!")
+    
 
         # Om aktien inte hittades, fråga ChatGPT istället
         try:

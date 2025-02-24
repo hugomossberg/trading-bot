@@ -24,14 +24,20 @@ async def analyse_stock(ib_client):
         history_df = ticker_obj.history(period="1mo")
         latest_close = history_df["Close"].iloc[-1] if not history_df.empty else None
         news_for_you = ticker_obj.news # Hämta nyhetsartiklar
+        pe_ratio = ticker_obj.info 
 
         stock_data = {
             "symbol": symbol,
             "name": info.get("shortName", "Okänd"),
             "sector": info.get("sector", "Okänd"),
             "prev3iousClose": info.get("previousClose"),
+            "priceToEarningsRatio": info.get("priceToEarningsRatio"),
+            "priceToBookRatio": info.get("priceToBookRatio"),
+            "PE": info.get("trailingPE"),
             "latestClose": latest_close,
             "News": news_for_you,
+            
+
         }
 
         print(f"✅ {symbol}: {stock_data['latestClose']}")
