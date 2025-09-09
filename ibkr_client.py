@@ -9,11 +9,15 @@ class IbClient:
        
 
     async def connect(self):
-        if not self.ib.connect():
-            await self.ib.connectAsync("127.0.0.1", 7497, clientId=0, timeout=30)
-            print("✅ API Connected!")
+        if not self.ib.isConnected():
+            try:
+                await self.ib.connectAsync("127.0.0.1", 4001, clientId=1, timeout=30)
+                print("✅ API Connected on 4002!")
+            except Exception as e:
+                print(f"❌ API connection failed: {e}")
         else:
-            ("ibkr redan ansluten")
+            print("ℹ️ IBKR redan ansluten")
+
     
 
     async def place_order(self, symbol, side, qty):
