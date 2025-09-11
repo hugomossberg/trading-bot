@@ -66,16 +66,21 @@ def buy_or_sell(stock_data):
     else:
         return "Håll"
 
-async def execute_order(ib_client, stock, signal, qty=10):
+# signals.py
+async def execute_order(ib_client, stock, signal, qty=10, bot=None, chat_id=None):
     if signal == "Köp":
         side = "BUY"
     elif signal == "Sälj":
         side = "SELL"
     else:
-        return None  # Ingen order placeras om signalen är "Håll"
-    
-    # Anta att ib_client redan är ansluten – ta alltså inte kontakt här igen
-    trade = await ib_client.place_order(stock["symbol"], side, qty)
+        return None
+
+    trade = await ib_client.place_order(
+        stock["symbol"], side, qty,
+        bot=bot,
+        chat_id=chat_id,
+    )
     return trade
+
 
 
