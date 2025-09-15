@@ -1,3 +1,4 @@
+# Core bot deps
 python-telegram-bot
 yfinance
 openai
