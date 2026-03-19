@@ -4,32 +4,39 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Virtuella miljöer
+# Virtual env
+.venv/
 venv/
-*.venv
+
+# Secrets / local config
 .env
-.xml
-# Loggfiler och temporära filer
-*.log
-*.tmp
-*.swp
-*.swo
+config.json
+secrets.json
 
-# OS-specifika filer
-.DS_Store
-Thumbs.db
-
-# IDE/editor-filer
+# IDE / editor
 .vscode/
 .idea/
 *.sublime-project
 *.sublime-workspace
 
-# Konfigurationsfiler som kan innehålla känslig information
-config.json
-secrets.json
-*.json
-Stock_info.json
-# Git-filer
+# Temp / swap / logs
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime / generated data
+runtime/
+storage/*.json
+storage/reports/
+archive/
+
+# Optional generated files
+scanner_parameters.xml
+
+# Backup files
 *.bak
-.struktur.txt 
