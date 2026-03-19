@@ -118,17 +118,25 @@ class OpenAi:
         if low in {"sellall", "/sellall"}:
             return await self._sell_all(update, context)
 
+        m = re.fullmatch(r"sell\s+([A-Za-z]{1,5})\s*(\d+)?", text, re.IGNORECASE)
+        if m:
+            sym = m.group(1).upper()
+            qty = int(m.group(2)) if m.group(2) else None
+            return await self._sell_one(update, context, sym, qty)
+
         # gissa ticker? (A–Z 1–5 tecken, ev. ? i slutet)
         m = re.fullmatch(r"([A-Za-z]{1,5})(?:[.\-][A-Za-z]+)?\??", text)
         if m:
             return await self._handle_stock_query(update, context, m.group(1).upper())
 
+    
         # fallback
         return await update.message.reply_text(
             "Kommandon:\n"
             "• status – visa portfölj/ordrar\n"
             "• tickers (eller 't') – visa universum och ägda\n"
             "• sellall – stäng alla positioner\n"
+            "• sell TICKER [antal] – sälj en position\n"
             "• TICKER – snabb koll (t.ex. TSLA, NVDA?, SQQQ)"
         )
 
@@ -235,6 +243,7 @@ class OpenAi:
             f"\nPositioner (topp):\n{pos_text}"
             f"\n\nÖppna ordrar:\n{ord_text}"
         )
+        
         await ack.edit_text(msg)
 
     # ---------- Tickers (universum + ägda) ----------
@@ -292,29 +301,91 @@ class OpenAi:
         if not ib.isConnected():
             return await update.message.reply_text("IB ej ansluten.")
 
-        is_open = _is_us_market_open()  # ← kolla om börsen är öppen
+        is_open = _is_us_market_open()
 
         try:
             positions = await ib.reqPositionsAsync()
         except Exception as e:
             return await update.message.reply_text(f"Kunde inte läsa positioner: {e}")
 
-        to_close = []
+        sent = []
+        skipped = []
+
         for p in positions:
             qty = float(p.position or 0.0)
             if abs(qty) < 1e-6:
                 continue
-            action = "SELL" if qty > 0 else "BUY"  # BUY för att täcka kort
-            order = MarketOrder(action, abs(qty))
+
+            # Skippa fractional direkt
+            if not float(abs(qty)).is_integer():
+                skipped.append(f"• {p.contract.symbol}: fractional {abs(qty)}")
+                continue
+
+            action = "SELL" if qty > 0 else "BUY"
+            order = MarketOrder(action, int(abs(qty)))
+
             try:
-                order.outsideRth = False if is_open else True  # ← bara AH om stängt
+                order.outsideRth = False if is_open else True
             except Exception:
                 pass
-            ib.placeOrder(p.contrt, order)
-            q_str = str(int(abs(qty))) if float(abs(qty)).is_integer() else f"{abs(qty):.2f}"
-            to_close.append(f"• {p.contract.symbol} {action} {q_str}")
 
-        if not to_close:
+            try:
+                contract = p.contract
+                contract.exchange = "SMART"   # försök undvika direkt-routing till NASDAQ
+                ib.placeOrder(contract, order)
+
+                sent.append(f"• {contract.symbol} {action} {int(abs(qty))}")
+            except Exception as e:
+                skipped.append(f"• {p.contract.symbol}: {e}")
+
+        if not sent and not skipped:
             return await update.message.reply_text("Inga positioner att stänga.")
 
-        await update.message.reply_text("📤 Skickar stängningsorder:\n" + "\n".join(to_close))
+        msg = []
+        if sent:
+            msg.append("📤 Skickade stängningsorder:\n" + "\n".join(sent))
+        if skipped:
+            msg.append("⚠️ Skippade:\n" + "\n".join(skipped))
+
+        await update.message.reply_text("\n\n".join(msg))
+
+    async def _sell_one(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str, qty: int | None = None):
+        ib_client = context.application.bot_data.get("ib")
+        if not ib_client:
+            return await update.message.reply_text("Ingen IB-klient i bot_data.")
+        ib = ib_client.ib
+        if not ib.isConnected():
+            return await update.message.reply_text("IB ej ansluten.")
+
+        try:
+            positions = await ib.reqPositionsAsync()
+        except Exception as e:
+            return await update.message.reply_text(f"Kunde inte läsa positioner: {e}")
+
+        pos = None
+        for p in positions:
+            if (p.contract.symbol or "").upper() == symbol.upper() and abs(float(p.position or 0.0)) > 1e-6:
+                pos = p
+                break
+
+        if not pos:
+            return await update.message.reply_text(f"Hittade ingen öppen position i {symbol}.")
+        current_qty = float(pos.position or 0.0)
+
+        if not float(abs(current_qty)).is_integer():
+            return await update.message.reply_text(
+                f"{symbol} har fractional position ({current_qty}), sälj manuellt i TWS."
+            )
+
+        sell_qty = int(abs(current_qty)) if qty is None else min(int(abs(current_qty)), qty)
+        action = "SELL" if current_qty > 0 else "BUY"
+
+        order = MarketOrder(action, sell_qty)
+
+        try:
+            contract = pos.contract
+            contract.exchange = "SMART"
+            ib.placeOrder(contract, order)
+            return await update.message.reply_text(f"📤 Skickade order: {action} {sell_qty} {symbol}")
+        except Exception as e:
+            return await update.message.reply_text(f"Kunde inte sälja {symbol}: {e}")

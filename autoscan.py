@@ -127,6 +127,12 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     DROP_IF_HOLD_STREAK = _env_int("DROP_IF_HOLD_STREAK", 1)
     CHURN_MIN          = _env_int("CHURN_MIN", 2)
 
+
+    log.info(
+        "CFG UNIVERSE_ROWS=%s CAND_MULT=%s AUTOTRADE=%s ENTRY_MODE=%s PASS_EX_MIN=%s EXCLUDE_BOUGHT_MIN=%s",
+        UNIVERSE_ROWS, CAND_MULT, AUTOTRADE, ENTRY_MODE, PASS_EX_MIN, EXCLUDE_BOUGHT_MIN
+    )
+
     if not AUTOSCAN:
         return
 
@@ -211,15 +217,20 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     # ---------- Kandidat-pool ----------
     by_sym = {(s.get("symbol") or "").upper(): s for s in universe if s.get("symbol")}
-    pool = [s for s in by_sym.keys() if s not in held and s not in open_buy_syms and not _is_excluded(s)]
-    random.shuffle(pool)
+    all_candidates = [s for s in by_sym.keys() if s not in held and s not in open_buy_syms and not _is_excluded(s)]
+    random.shuffle(all_candidates)
 
-    # Garanti: om för lite pga exkludering → ta alla icke-ägda
-    if len(pool) < UNIVERSE_ROWS:
-        pool = [s for s in by_sym.keys() if s not in held]
-        random.shuffle(pool)
+    if len(all_candidates) < UNIVERSE_ROWS:
+        all_candidates = [s for s in by_sym.keys() if s not in held]
+        random.shuffle(all_candidates)
 
-    scan_set = pool[:UNIVERSE_ROWS]
+    scan_set = all_candidates[:UNIVERSE_ROWS]
+    replacement_pool = [s for s in all_candidates if s not in scan_set]
+
+    log.info(
+        "POOL universe=%d all_candidates=%d scan_set=%d replacement_pool=%d",
+        len(by_sym), len(all_candidates), len(scan_set), len(replacement_pool)
+    )
 
     # Terminal: visa vilka vi kollar + pris
     rows_for_log = []
@@ -257,35 +268,34 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             signal = "Håll"
 
         prev_sig = state["last_signal"].get(sym)
-        place_order = (signal == "Köp")
         drop_reason = None
 
-        # Behåll endast rena "Köp" just nu
-        if signal != "Köp":
-            drop_reason = f"ersätt pga {signal}"
-        elif ENTRY_MODE == "buy_only" and signal != "Köp":
-            drop_reason = "entry_mode"
-        elif ONLY_TRADE_ON_SIGNAL_CHANGE and prev_sig == signal:
+        if ENTRY_MODE == "buy_only":
+            if signal != "Köp":
+                drop_reason = f"ersätt pga {signal}"
+        elif ENTRY_MODE == "all":
+            if signal == "Håll":
+                drop_reason = "ersätt pga Håll"
+
+        if ONLY_TRADE_ON_SIGNAL_CHANGE and prev_sig == signal:
             drop_reason = "ingen signaländring"
         elif _in_cooldown(sym):
             drop_reason = "cooldown"
-
         if drop_reason:
             if sym in scan_set:
                 scan_set.remove(sym)
             removed.append(sym)
             # ersätt en ny kandidat
-            repl = None
-            for candidate in pool:
-                if candidate not in scan_set and candidate not in removed and candidate not in added and candidate not in held:
-                    if not _is_excluded(candidate):
-                        repl = candidate
-                        break
+            repl = replacement_pool.pop(0) if replacement_pool else None
+
             if repl:
                 scan_set.append(repl)
+                scan_set = scan_set[:UNIVERSE_ROWS]
                 added.append(repl)
+                log.info("[ADD] %s → ersätter %s", repl, sym)
+
             log.info("[REMOVE] %s → %s", sym, drop_reason)
-            update_signal_state(state, sym, "Håll")
+            update_signal_state(state, sym, signal)
             # kort exkludering av pass
             state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=PASS_EX_MIN)).isoformat()
             continue
@@ -309,16 +319,23 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         trade = None
 
         if AUTOTRADE and risk_ok and market_ok and not _in_cooldown(sym):
-            key = f"{sym}:BUY:{int(qty)}"
+            action_signal = signal
+            key = f"{sym}:{action_signal}:{int(qty)}"
+
             if not is_dup(key):
                 try:
-                    trade = await execute_order(ib_client, raw, "Köp", qty=qty, bot=bot, chat_id=admin_chat_id)
+                    trade = await execute_order(ib_client, raw, action_signal, qty=qty, bot=bot, chat_id=admin_chat_id)
+
                 except Exception as e:
                     trade = None
                     log.error("[ORDER-ERR] %s → %s", sym, e)
                 if trade:
-                    orders_buy += 1
-                    log.info("[ORDER] KÖP %s x%d", sym, qty)
+                    if action_signal == "Köp":
+                        orders_buy += 1
+                        log.info("[ORDER] KÖP %s x%d", sym, qty)
+                    elif action_signal == "Sälj":
+                        orders_sell += 1
+                        log.info("[ORDER] SÄLJ %s x%d", sym, qty)
             else:
                 log.info("[SKIP] %s → dubblettnyckel", sym)
         else:
@@ -339,15 +356,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         log.info("[REMOVE] %s → köpt/simulerad + exkluderas %d min", sym, EXCLUDE_BOUGHT_MIN)
 
         # Ersätt en köpt ticker
-        repl = None
-        for candidate in pool:
-            if candidate not in scan_set and candidate not in removed and candidate not in added and candidate not in held:
-                if not _is_excluded(candidate):
-                    repl = candidate
-                    break
+        repl = replacement_pool.pop(0) if replacement_pool else None
+
         if repl:
             scan_set.append(repl)
+            scan_set = scan_set[:UNIVERSE_ROWS]
             added.append(repl)
+            log.info("[ADD] %s → ersätter %s", repl, sym)
 
         update_signal_state(state, sym, signal)
 
