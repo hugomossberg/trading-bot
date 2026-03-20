@@ -1,31 +1,34 @@
-import os
+#autoscan.py
 import json
-import random
 import logging
+import os
+import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.core.signals import get_signal_analysis, execute_order
-from app.core.universe_manager import (
-    load_state,
-    save_state,
-    update_signal_state,
-    rotate_universe,
-    reset_symbol_rotation_state,
-)
-from app.core.helpers import kill_switch_ok, market_open_now, is_dup
-from app.core.scanner import ensure_stock_info
 from app.config import (
-    STOCK_INFO_PATH,
+    AUTO_QTY,
     AUTOSCAN,
     AUTOTRADE,
-    UNIVERSE_ROWS,
     CANDIDATE_MULTIPLIER,
-    AUTO_QTY,
-    SUMMARY_NOTIFS,
-    LOG_UNIVERSE,
     DEBUG_AUTOTRADE,
     DROP_IF_HOLD_STREAK,
+    LOG_UNIVERSE,
+    SIGNAL_LOG_PATH,
+    STOCK_INFO_PATH,
+    SUMMARY_NOTIFS,
+    UNIVERSE_ROWS,
+)
+from app.core.helpers import is_dup, kill_switch_ok, market_open_now
+from app.core.scanner import ensure_stock_info
+from app.core.signals import execute_order, get_signal_analysis
+from app.core.storage_utils import append_event, save_daily_report, save_daily_snapshot
+from app.core.universe_manager import (
+    load_state,
+    reset_symbol_rotation_state,
+    rotate_universe,
+    save_state,
+    update_signal_state,
 )
 
 log = logging.getLogger("autoscan")
@@ -230,6 +233,11 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     orders_buy = 0
     orders_sell = 0
 
+    rotations_out = []
+    rotations_in = []
+    orders_for_report = []
+    scan_results = []
+
     def _available_replacements(current_scan, banned=None):
         banned = banned or set()
         current_set = set(current_scan)
@@ -310,10 +318,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             signal = analysis["signal"]
             analysis["timestamp"] = _now_utc().isoformat()
 
-            with open("storage/signal_log.json", "a", encoding="utf-8") as f:
+            with open(str(SIGNAL_LOG_PATH), "a", encoding="utf-8") as f:
                 f.write(json.dumps(analysis, ensure_ascii=False) + "\n")
 
-            trim_jsonl("storage/signal_log.json", keep_last=5000)
+            trim_jsonl(str(SIGNAL_LOG_PATH), keep_last=5000)
 
         except Exception as e:
             signal = "Håll"
@@ -325,6 +333,33 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             }
 
         raw_technicals = analysis.get("raw_technicals") or {}
+
+        analysis_row = dict(analysis)
+        analysis_row["symbol"] = sym
+        analysis_row["name"] = raw.get("name") or raw.get("companyName") or sym
+        scan_results.append(analysis_row)
+
+        append_event(
+            "signal_evaluated",
+            symbol=sym,
+            name=raw.get("name") or raw.get("companyName") or sym,
+            data={
+                "signal": signal,
+                "score": analysis.get("total_score"),
+                "price": raw_technicals.get("price"),
+            },
+        )
+
+        if signal == "Köp":
+            append_event(
+                "buy_signal",
+                symbol=sym,
+                name=raw.get("name") or raw.get("companyName") or sym,
+                data={
+                    "score": analysis.get("total_score"),
+                    "price": raw_technicals.get("price"),
+                },
+            )
 
         if sym == "BRK-B" and not raw_technicals.get("price"):
             log.info("[KEEP] %s → IB technicals saknas ännu, behålls tillfälligt", sym)
@@ -356,6 +391,20 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             removed_this_pass.add(sym)
 
             log.info("[REMOVE] %s → %s", sym, drop_reason)
+
+            rotations_out.append({
+                "symbol": sym,
+                "name": raw.get("name") or raw.get("companyName") or sym,
+                "reason": drop_reason,
+            })
+
+            append_event(
+                "rotation_out",
+                symbol=sym,
+                name=raw.get("name") or raw.get("companyName") or sym,
+                reason=drop_reason,
+            )
+
             update_signal_state(state, sym, signal)
             state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=pass_ex_min)).isoformat()
             reset_symbol_rotation_state(state, sym)
@@ -366,6 +415,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
                 added.append(repl)
                 log.info("[ADD] %s → ersätter %s", repl, sym)
+
+                repl_raw = by_sym.get(repl) or {}
+                rotations_in.append({
+                    "symbol": repl,
+                    "name": repl_raw.get("name") or repl_raw.get("companyName") or repl,
+                })
+
+                append_event(
+                    "rotation_in",
+                    symbol=repl,
+                    name=repl_raw.get("name") or repl_raw.get("companyName") or repl,
+                    reason=f"replaced {sym}",
+                )
 
             continue
 
@@ -437,11 +499,27 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                         state["buys_today"][sym] = buys_today_rec
                         log.info("[ORDER] KÖP %s x%d", sym, qty)
 
+                        orders_for_report.append(f"BUY submitted: {sym} x{qty}")
+                        append_event(
+                            "buy_submitted",
+                            symbol=sym,
+                            name=raw.get("name") or raw.get("companyName") or sym,
+                            data={"qty": qty},
+                        )
+
                     elif action_signal == "Sälj":
                         orders_sell += 1
                         sells_today_rec["count"] = int(sells_today_rec.get("count", 0)) + 1
                         state["sells_today"][sym] = sells_today_rec
                         log.info("[ORDER] SÄLJ %s x%d", sym, qty)
+
+                        orders_for_report.append(f"SELL submitted: {sym} x{qty}")
+                        append_event(
+                            "sell_submitted",
+                            symbol=sym,
+                            name=raw.get("name") or raw.get("companyName") or sym,
+                            data={"qty": qty},
+                        )
 
                     state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=exclude_bought_min)).isoformat()
                     state["last_trade_ts"][sym] = _now_utc().isoformat()
@@ -456,12 +534,38 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     reason_txt = "köpt" if action_signal == "Köp" else "såld"
                     log.info("[REMOVE] %s → %s + exkluderas %d min", sym, reason_txt, exclude_bought_min)
 
+                    rotations_out.append({
+                        "symbol": sym,
+                        "name": raw.get("name") or raw.get("companyName") or sym,
+                        "reason": f"{reason_txt} + excluded {exclude_bought_min} min",
+                    })
+
+                    append_event(
+                        "rotation_out",
+                        symbol=sym,
+                        name=raw.get("name") or raw.get("companyName") or sym,
+                        reason=f"{reason_txt} + excluded {exclude_bought_min} min",
+                    )
+
                     repl = _take_replacement(scan_set, banned=removed_this_pass)
                     if repl:
                         scan_set.append(repl)
                         scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
                         added.append(repl)
                         log.info("[ADD] %s → ersätter %s", repl, sym)
+
+                        repl_raw = by_sym.get(repl) or {}
+                        rotations_in.append({
+                            "symbol": repl,
+                            "name": repl_raw.get("name") or repl_raw.get("companyName") or repl,
+                        })
+
+                        append_event(
+                            "rotation_in",
+                            symbol=repl,
+                            name=repl_raw.get("name") or repl_raw.get("companyName") or repl,
+                            reason=f"replaced {sym}",
+                        )
                 else:
                     log.info("[KEEP] %s → ingen verklig order, behålls i universe", sym)
             else:
@@ -493,6 +597,32 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         )
 
     state["universe"] = list(scan_set)
+
+    replacement_pool_size = len(_available_replacements(scan_set, banned=removed_this_pass))
+
+    save_daily_snapshot(
+        state=state,
+        summary={
+            "universe_size": len(state.get("universe", [])),
+            "scan_set_size": len(scan_set),
+            "replacement_pool_size": replacement_pool_size,
+            "orders_buy": orders_buy,
+            "orders_sell": orders_sell,
+        },
+        scan_set=scan_results,
+        market_open=market_ok,
+    )
+
+    save_daily_report(
+        market_open=market_ok,
+        universe_size=len(by_sym),
+        scan_set=scan_results,
+        replacement_pool_size=replacement_pool_size,
+        rotations_out=rotations_out,
+        rotations_in=rotations_in,
+        orders=orders_for_report,
+    )
+
     save_state(state)
 
     if summary_notifs and admin_chat_id:

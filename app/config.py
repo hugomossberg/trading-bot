@@ -1,5 +1,5 @@
-#config.py
 import os
+from pathlib import Path
 
 
 def env_bool(key: str, default: bool = False) -> bool:
@@ -23,13 +23,28 @@ def env_float(key: str, default: float) -> float:
         return default
 
 
+# ===== Base paths =====
+STORAGE_DIR = Path("storage")
+STATE_DIR = STORAGE_DIR / "state"
+SNAPSHOT_DIR = STORAGE_DIR / "snapshots"
+EVENTS_DIR = STORAGE_DIR / "events"
+REPORTS_DIR = STORAGE_DIR / "reports"
+
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ===== JSON files =====
+STATE_PATH = Path(os.getenv("STATE_PATH", str(STATE_DIR / "trade_state.json")))
+SIGNAL_LOG_PATH = Path(os.getenv("SIGNAL_LOG_PATH", str(STATE_DIR / "signal_log.json")))
+STOCK_INFO_PATH = Path(os.getenv("STOCK_INFO_PATH", str(STATE_DIR / "stock_info.json")))
+
+# ===== Env config =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ADMIN_CHAT_ID = env_int("ADMIN_CHAT_ID", 0)
 TWS_PORT = env_int("TWS_PORT", 4002)
-
-STATE_PATH = os.getenv("STATE_PATH", "storage/trade_state.json")
-STOCK_INFO_PATH = os.getenv("STOCK_INFO_PATH", "storage/Stock_info.json")
 
 AUTOSCAN = env_bool("AUTOSCAN", True)
 AUTOTRADE = env_bool("AUTOTRADE", False)

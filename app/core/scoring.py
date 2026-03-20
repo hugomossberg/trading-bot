@@ -133,6 +133,9 @@ def score_profit_margin(finance_data):
     if margin is None:
         return 0
 
+    if -1 < margin < 1:
+        margin *= 100
+
     if margin >= 20:
         return 2
     if margin >= 10:
@@ -147,13 +150,16 @@ def score_debt_to_equity(finance_data):
     if debt_to_equity is None:
         return 0
 
+    if debt_to_equity < 0:
+        return 0
+
     if debt_to_equity < 0.5:
         return 2
-    if debt_to_equity < 1.0:
+    if debt_to_equity < 1.5:
         return 1
-    if debt_to_equity <= 1.5:
+    if debt_to_equity < 3.0:
         return 0
-    if debt_to_equity <= 2.5:
+    if debt_to_equity < 5.0:
         return -1
     return -2
 
@@ -166,13 +172,11 @@ def score_news(stock_data):
     news_summaries = get_news_summaries(stock_data)
     sentiment = analyze_news_sentiment(news_summaries)
 
-    if sentiment > 0.25:
+    if sentiment >= 0.10:
         return 1, sentiment
-    if sentiment < -0.25:
+    if sentiment <= -0.10:
         return -1, sentiment
     return 0, sentiment
-
-
 # =========================
 # TECHNICALS
 # =========================

@@ -84,3 +84,28 @@ class FMPClient:
 
     def historical_eod_light(self, symbol: str):
         return self._get("historical-price-eod/light", symbol=symbol)
+
+    def income_statement(self, symbol: str, period: str = "annual", limit: int = 5):
+        return self._get("income-statement", symbol=symbol, period=period, limit=limit)
+
+    def balance_sheet(self, symbol: str, period: str = "annual", limit: int = 5):
+        return self._get("balance-sheet-statement", symbol=symbol, period=period, limit=limit)
+
+    def cash_flow(self, symbol: str, period: str = "annual", limit: int = 5):
+        return self._get("cash-flow-statement", symbol=symbol, period=period, limit=limit)
+
+    def ratios(self, symbol: str):
+        data = self._get("ratios", symbol=symbol)
+        return data[0] if isinstance(data, list) and data else data
+
+    def key_metrics(self, symbol: str):
+        data = self._get("key-metrics", symbol=symbol)
+        return data[0] if isinstance(data, list) and data else data
+    
+    def financial_growth(self, symbol: str):
+        data = self._get("financial-growth", symbol=symbol)
+        return data[0] if isinstance(data, list) and data else data
+
+    def financial_scores(self, symbol: str):
+        data = self._get("financial-scores", symbol=symbol)
+        return data[0] if isinstance(data, list) and data else data

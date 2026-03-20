@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from app.config import STOCK_INFO_PATH
 
-STOCK_INFO_PATH = "storage/Stock_info.json"
+from app.config import STOCK_INFO_PATH
 SE_TZ = ZoneInfo("Europe/Stockholm")
 
 

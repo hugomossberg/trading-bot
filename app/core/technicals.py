@@ -69,6 +69,11 @@ def _build_contract(symbol: str):
         base_symbol = symbol.replace(".ST", "")
         return Stock(base_symbol, "SMART", "SEK")
 
+    ib_symbol_map = {
+        "BRK-B": "BRK B",
+    }
+
+    symbol = ib_symbol_map.get(symbol, symbol)
     return Stock(symbol, "SMART", "USD")
 
 

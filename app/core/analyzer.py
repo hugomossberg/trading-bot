@@ -1,3 +1,4 @@
+#analays.py
 from app.core.scoring import (
     score_pe,
     score_eps,
@@ -21,7 +22,7 @@ from app.core.filters import precheck_stock
 WEIGHTS = {
     "fundamentals": 1.0,
     "financials": 1.0,
-    "news": 0.5,
+    "news": 1.0,
     "technicals": 1.5,
     "liquidity": 1.2,
 }
@@ -43,7 +44,7 @@ def evaluate_fundamentals(stock_data):
 
 
 def evaluate_financials(stock_data):
-    finance_data = stock_data.get("quarterlyFinance", {}) or {}
+    finance_data = stock_data or {}
 
     details = {
         "revenue_growth": score_revenue_growth(finance_data),

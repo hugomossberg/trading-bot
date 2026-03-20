@@ -1,10 +1,8 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 
-# Virtual env
+# Virtual environments
 .venv/
 venv/
 
@@ -30,9 +28,11 @@ secrets.json
 Thumbs.db
 
 # Runtime / generated data
-runtime/
-storage/*.json
+storage/state/*.json
+storage/events/
 storage/reports/
+storage/snapshots/
+runtime/
 archive/
 
 # Optional generated files
