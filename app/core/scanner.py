@@ -109,12 +109,13 @@ async def refresh_stock_info(ib_client, limit: int = 50) -> list[dict]:
         tickers = _fallback_tickers()
 
     rows = []
-    for sym in tickers[:limit]:
+    for i, sym in enumerate(tickers[:limit], start=1):
         try:
+            log.info("[scanner] Hämtar %s (%d/%d)", sym, i, min(len(tickers), limit))
             rows.append(_fetch_yf_snapshot(sym))
             time.sleep(0.05)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("[scanner] Misslyckades med %s: %s", sym, e)
 
     if not rows:
         # sista fallback: skapa tom men giltig fil
@@ -134,5 +135,5 @@ async def ensure_stock_info(ib_client, min_count: int = 10) -> list[dict]:
     data = _read_stock_info()
     if not isinstance(data, list) or len(data) < min_count:
         log.info("[scanner] Stock_info.json saknas/korrupt/otillräcklig – bygger om…")
-        data = await refresh_stock_info(ib_client, limit=max(min_count * 3, 30))
+        data = await refresh_stock_info(ib_client, limit=max(min_count, 30))
     return data or []
