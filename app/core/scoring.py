@@ -1,6 +1,4 @@
-#scoring.py
 from textblob import TextBlob
-
 
 
 def _safe_float(value, default=None):
@@ -8,26 +6,35 @@ def _safe_float(value, default=None):
         if value is None:
             return default
         if isinstance(value, str):
-            value = value.strip()
+            value = value.strip().replace(",", ".")
             if value.lower() in {"inf", "infinity", "nan", ""}:
                 return default
         return float(value)
     except Exception:
         return default
-    
-
 
 
 def analyze_news_sentiment(news_articles):
     if not news_articles:
         return 0.0
 
-    total_sentiment = 0
-    for article in news_articles:
-        blob = TextBlob(article)
-        total_sentiment += blob.sentiment.polarity
+    total_sentiment = 0.0
+    count = 0
 
-    return total_sentiment / len(news_articles)
+    for article in news_articles:
+        if not article:
+            continue
+        try:
+            blob = TextBlob(str(article))
+            total_sentiment += blob.sentiment.polarity
+            count += 1
+        except Exception:
+            continue
+
+    if count == 0:
+        return 0.0
+
+    return total_sentiment / count
 
 
 def get_news_summaries(stock_data):
@@ -171,9 +178,9 @@ def score_news(stock_data):
 # =========================
 
 def score_price_trend(technicals):
-    price = technicals.get("price")
-    sma20 = technicals.get("sma20")
-    sma50 = technicals.get("sma50")
+    price = _safe_float(technicals.get("price"))
+    sma20 = _safe_float(technicals.get("sma20"))
+    sma50 = _safe_float(technicals.get("sma50"))
 
     if price is None or sma20 is None or sma50 is None:
         return 0
@@ -190,7 +197,7 @@ def score_price_trend(technicals):
 
 
 def score_rsi(technicals):
-    rsi = technicals.get("rsi14")
+    rsi = _safe_float(technicals.get("rsi14"))
     if rsi is None:
         return 0
 
@@ -206,7 +213,7 @@ def score_rsi(technicals):
 
 
 def score_volume_spike(technicals):
-    volume_ratio = technicals.get("volume_ratio")
+    volume_ratio = _safe_float(technicals.get("volume_ratio"))
     if volume_ratio is None:
         return 0
 
@@ -218,7 +225,7 @@ def score_volume_spike(technicals):
 
 
 def score_volatility(technicals):
-    atr_pct = technicals.get("atr_pct")
+    atr_pct = _safe_float(technicals.get("atr_pct"))
     if atr_pct is None:
         return 0
 
@@ -232,8 +239,8 @@ def score_volatility(technicals):
 
 
 def score_momentum(technicals):
-    mom20 = technicals.get("momentum_20")
-    mom60 = technicals.get("momentum_60")
+    mom20 = _safe_float(technicals.get("momentum_20"))
+    mom60 = _safe_float(technicals.get("momentum_60"))
 
     score = 0
 
@@ -251,8 +258,9 @@ def score_momentum(technicals):
 
     return score
 
+
 def score_liquidity(technicals):
-    adv = technicals.get("avg_dollar_volume_20")
+    adv = _safe_float(technicals.get("avg_dollar_volume_20"))
     if adv is None:
         return 0
 
