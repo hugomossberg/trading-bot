@@ -1,3 +1,4 @@
+#autoscan.py
 import os
 import json
 import random
@@ -7,7 +8,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from app.core.signals import get_signal_analysis, execute_order
-from app.core.universe_manager import load_state, save_state, update_signal_state
+from app.core.universe_manager import load_state, save_state, update_signal_state, rotate_universe
 from app.core.helpers import kill_switch_ok, us_market_open_now, is_dup
 from app.core.scanner import ensure_stock_info
 from app.config import (
@@ -107,7 +108,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     max_pos_per_symbol = _env_int("MAX_POS_PER_SYMBOL", 0)
     max_buys_per_day = _env_int("MAX_BUYS_PER_DAY", 1)
     max_sells_per_day = _env_int("MAX_SELLS_PER_DAY", 2)  # kvar för framtida säljlogik
-    exclude_minutes = _env_int("EXCLUDE_MINUTES", 120)
+    #exclude_minutes = _env_int("EXCLUDE_MINUTES", 120)
     pass_ex_min = _env_int("PASS_EXCLUDE_MINUTES", _env_int("ASS_EXCLUDE_MINUTES", 20))
     exclude_bought_min = _env_int("EXCLUDE_BOUGHT_MIN", 120)
     prefer_non_hold = _env_bool("PREFER_NON_HOLD", True)
@@ -212,18 +213,29 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     # -------- Kandidat-pool --------
     by_sym = {(s.get("symbol") or "").upper(): s for s in universe if s.get("symbol")}
+
     all_candidates = [
         s for s in by_sym.keys()
         if s not in held and s not in open_buy_syms and not _is_excluded(s)
     ]
-    random.shuffle(all_candidates)
 
     if len(all_candidates) < universe_rows:
         all_candidates = [s for s in by_sym.keys() if s not in held]
-        random.shuffle(all_candidates)
 
-    scan_set = all_candidates[:universe_rows]
+    random.shuffle(all_candidates)
+
+    prev_uni = [s.upper() for s in state.get("universe", []) if s]
+    scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, all_candidates, state)
+
     replacement_pool = [s for s in all_candidates if s not in scan_set]
+
+    # spara direkt aktuellt universe i state
+    state["universe"] = list(scan_set)
+
+    if dropped_pre:
+        log.info("[PRE-REMOVE] %s", ", ".join(dropped_pre))
+    if added_pre:
+        log.info("[PRE-ADD] %s", ", ".join(added_pre))
 
     log.info(
         "POOL universe=%d all_candidates=%d scan_set=%d replacement_pool=%d",
@@ -259,8 +271,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     orders_buy = 0
     orders_sell = 0
 
-    # -------- Iterera kandidater --------
-        # -------- Iterera kandidater --------
+    # -------- Iterera kandidater -------
     for sym in list(scan_set):
         raw = by_sym.get(sym) or {"symbol": sym, "name": sym}
         stock = _normalize_stock(raw)
@@ -317,8 +328,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             continue
 
         # -------- Köp --------
-
-        # -------- Köp --------
         if max_pos_per_symbol > 0:
             remaining_cap = max_pos_per_symbol
             if remaining_cap <= 0:
@@ -359,8 +368,22 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     elif action_signal == "Sälj":
                         orders_sell += 1
                         log.info("[ORDER] SÄLJ %s x%d", sym, qty)
-            else:
-                log.info("[SKIP] %s → dubblettnyckel", sym)
+
+                    state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=exclude_bought_min)).isoformat()
+                    state["last_trade_ts"][sym] = _now_utc().isoformat()
+                    buys_today_rec["count"] = int(buys_today_rec.get("count", 0)) + 1
+                    state["buys_today"][sym] = buys_today_rec
+                    removed.append(sym)
+                    log.info("[REMOVE] %s → köpt + exkluderas %d min", sym, exclude_bought_min)
+
+                    repl = replacement_pool.pop(0) if replacement_pool else None
+                    if repl:
+                        scan_set.append(repl)
+                        scan_set = scan_set[:universe_rows]
+                        added.append(repl)
+                        log.info("[ADD] %s → ersätter %s", repl, sym)
+                else:
+                    log.info("[KEEP] %s → ingen verklig order, behålls i universe", sym)
         else:
             if debug_autotrade:
                 why = []
@@ -374,23 +397,12 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     why.append("cooldown")
                 log.info("[SIM] KÖP %s x%d (%s)", sym, qty, ",".join(why) or "-")
 
-        state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=exclude_bought_min)).isoformat()
-        state["last_trade_ts"][sym] = _now_utc().isoformat()
-        buys_today_rec["count"] = int(buys_today_rec.get("count", 0)) + (1 if trade else 0)
-        state["buys_today"][sym] = buys_today_rec
-        removed.append(sym)
-        log.info("[REMOVE] %s → köpt/simulerad + exkluderas %d min", sym, exclude_bought_min)
-
-        repl = replacement_pool.pop(0) if replacement_pool else None
-        if repl:
-            scan_set.append(repl)
-            scan_set = scan_set[:universe_rows]
-            added.append(repl)
-            log.info("[ADD] %s → ersätter %s", repl, sym)
-
+            log.info("[KEEP] %s → ingen verklig order, behålls i universe", sym)
+            
         update_signal_state(state, sym, signal)
 
     # -------- Spara state --------
+    state["universe"] = list(scan_set)
     save_state(state)
 
     # -------- Telegram-summering --------

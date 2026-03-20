@@ -132,7 +132,7 @@ async def ensure_stock_info(ib_client, min_count: int = 10) -> list[dict]:
     Returnerar listan.
     """
     data = _read_stock_info()
-    if not isinstance(data, list) or len(data) == 0:
+    if not isinstance(data, list) or len(data) < min_count:
         log.info("[scanner] Stock_info.json saknas/korrupt/otillräcklig – bygger om…")
-        data = await refresh_stock_info(ib_client, limit=max(min_count*3, 30))
+        data = await refresh_stock_info(ib_client, limit=max(min_count * 3, 30))
     return data or []
