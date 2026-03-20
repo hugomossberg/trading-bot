@@ -4,6 +4,7 @@ import random
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 from app.core.signals import get_signal_analysis, execute_order
 from app.core.universe_manager import load_state, save_state, update_signal_state
@@ -64,6 +65,17 @@ def _normalize_stock(stock: dict) -> dict:
 
 def _now_utc():
     return datetime.now(timezone.utc)
+
+
+def trim_jsonl(path: str, keep_last: int = 5000):
+    p = Path(path)
+    if not p.exists():
+        return
+    with p.open("r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if len(lines) > keep_last:
+        with p.open("w", encoding="utf-8") as f:
+            f.writelines(lines[-keep_last:])
 
 
 async def _call_ensure_stock_info(ib_client, rows_target: int):
@@ -260,6 +272,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             with open("storage/signal_log.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(analysis, ensure_ascii=False) + "\n")
+
+            trim_jsonl("storage/signal_log.jsonl", keep_last=5000)
 
         except Exception as e:
             signal = "Håll"
