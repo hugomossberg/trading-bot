@@ -1,7 +1,7 @@
+#autoscan.py
 import json
 import logging
 import os
-import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -205,6 +205,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     max_sells_per_day = _env_int("MAX_SELLS_PER_DAY", 2)
     pass_ex_min = _env_int("PASS_EXCLUDE_MINUTES", _env_int("ASS_EXCLUDE_MINUTES", 20))
     exclude_bought_min = _env_int("EXCLUDE_BOUGHT_MIN", 120)
+    max_order_value = _to_float(os.getenv("MAX_ORDER_VALUE_USD", "30"), 30.0)
 
     log.info(
         "CFG UNIVERSE_ROWS=%s CAND_MULT=%s AUTOTRADE=%s ENTRY_MODE=%s PASS_EX_MIN=%s EXCLUDE_BOUGHT_MIN=%s",
@@ -306,10 +307,29 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     ]
 
     if len(all_candidates) < universe_rows:
+        log.warning("[autoscan] Få kandidater efter exclude-filter, backar till bredare kandidatlista")
         all_candidates = [s for s in by_sym.keys() if s not in held and s not in open_buy_syms]
 
     all_candidates = _dedupe_keep_order(all_candidates)
-    random.shuffle(all_candidates)
+    all_candidates = sorted(
+        all_candidates,
+        key=lambda s: _to_float((by_sym.get(s) or {}).get("latestClose"), 999999)
+    )
+
+    max_scan_price = _env_int("MAX_SCAN_PRICE", 150)
+
+    all_candidates = [
+        s for s in all_candidates
+        if _to_float((by_sym.get(s) or {}).get("latestClose"), 999999) <= max_scan_price
+    ]
+
+    if len(all_candidates) < universe_rows:
+        log.warning(
+            "[autoscan] För få kandidater efter MAX_SCAN_PRICE=%s (%d kvar för target=%d)",
+            max_scan_price,
+            len(all_candidates),
+            universe_rows,
+    )
 
     prev_uni = [s.upper() for s in state.get("universe", []) if s]
     scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, all_candidates, state)
@@ -472,17 +492,24 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         drop_reason = None
         hold_streak = int(state.get("hold_streak", {}).get(sym, 0))
         effective_hold_streak = hold_streak + 1 if signal == "Håll" else 0
+        score = int(analysis.get("total_score", 0) or 0)
 
         if entry_mode == "buy_only":
             if signal != "Köp":
                 drop_reason = f"ersätt pga {signal}"
+
         elif entry_mode == "all":
-            if market_ok and signal == "Håll" and effective_hold_streak >= DROP_IF_HOLD_STREAK:
+            if signal == "Sälj":
+                drop_reason = "ersätt pga Sälj"
+            elif market_ok and signal == "Håll" and effective_hold_streak >= DROP_IF_HOLD_STREAK:
                 drop_reason = f"ersätt pga Håll-streak={effective_hold_streak}"
+            elif score <= -3:
+                drop_reason = f"ersätt pga låg score={score}"
 
         if drop_reason:
             candidate_scan = [s for s in scan_set if s != sym]
-            repl = _take_replacement(candidate_scan, banned=removed_this_pass)
+            repl = _take_replacement(candidate_scan, banned=removed_this_pass | {sym})
+            log.info("[ROTATE-CHECK] %s → %s | signal=%s | score=%s", sym, drop_reason, signal, score)
 
             if not repl:
                 log.info("[KEEP] %s → %s men ingen ersättare finns", sym, drop_reason)
@@ -583,6 +610,15 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 qty = min(auto_qty, int(current_pos))
                 if qty <= 0:
                     log.info("[SKIP] %s → ingen säljbar position", sym)
+                    update_signal_state(state, sym, signal)
+                    continue
+
+            price_now = _to_float(raw_technicals.get("price"), 0) or _to_float(raw.get("latestClose"), 0)
+
+            if action_signal == "Köp" and price_now > 0:
+                est_value = price_now * qty
+                if est_value > max_order_value:
+                    log.info("[SKIP] %s → ordervärde %.2f över max %.2f", sym, est_value, max_order_value)
                     update_signal_state(state, sym, signal)
                     continue
 

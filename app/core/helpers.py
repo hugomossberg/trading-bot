@@ -1,4 +1,3 @@
-#helpers.py
 import os, time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -36,6 +35,9 @@ def panic_on(reason="manual panic"): _KILL.update(on=True, reason=reason)
 def panic_off(): _KILL.update(on=False, reason="")
 
 def market_open_now(now_local: datetime | None = None) -> bool:
+    if os.getenv("SIM_MARKET", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+
     tz = ZoneInfo(PROFILE["timezone"])
     now_local = now_local or datetime.now(tz)
 

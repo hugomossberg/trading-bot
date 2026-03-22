@@ -1,3 +1,4 @@
+#signals.py
 from app.core.analyzer import analyze_stock, decide_signal
 
 
