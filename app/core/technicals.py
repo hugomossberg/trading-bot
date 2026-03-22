@@ -3,6 +3,9 @@ import time
 import logging
 from typing import Optional
 
+import os
+from copy import deepcopy
+
 import pandas as pd
 
 from app.core.market_profile import PROFILE, MARKET_PROFILE
@@ -12,6 +15,12 @@ log = logging.getLogger("technicals")
 _HISTORY_CACHE = {}
 _HISTORY_TTL_SEC = 300
 _IB_CLIENT = None
+
+def _sim_enabled() -> bool:
+    return os.getenv("SIM_MARKET", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+def _sim_profile() -> str:
+    return os.getenv("SIM_PROFILE", "flat").strip().lower()
 
 
 def set_ib_client(ib_client):
@@ -246,6 +255,74 @@ def _empty_snapshot():
     }
 
 
+def _apply_simulation(symbol: str, technicals: dict) -> dict:
+    t = deepcopy(technicals or {})
+    profile = _sim_profile()
+
+    price = _safe_float(t.get("price"))
+    sma20 = _safe_float(t.get("sma20"))
+    sma50 = _safe_float(t.get("sma50"))
+    rsi14 = _safe_float(t.get("rsi14"))
+    volume_ratio = _safe_float(t.get("volume_ratio"))
+    momentum_20 = _safe_float(t.get("momentum_20"))
+    momentum_60 = _safe_float(t.get("momentum_60"))
+    atr_pct = _safe_float(t.get("atr_pct"))
+
+    if price is None:
+        return t
+
+    if profile == "breakout":
+        t["price"] = round(price * 1.025, 2)
+        if sma20 is not None:
+            t["sma20"] = round(min(t["price"] * 0.995, sma20 * 1.005), 2)
+        if sma50 is not None:
+            t["sma50"] = round(min((t.get("sma20") or sma50) * 0.995, sma50 * 1.002), 2)
+        if rsi14 is not None:
+            t["rsi14"] = min(82.0, rsi14 + 8.0)
+        if volume_ratio is not None:
+            t["volume_ratio"] = max(1.8, volume_ratio)
+        else:
+            t["volume_ratio"] = 1.8
+        if momentum_20 is not None:
+            t["momentum_20"] = momentum_20 + 4.0
+        if momentum_60 is not None:
+            t["momentum_60"] = momentum_60 + 6.0
+        if atr_pct is not None:
+            t["atr_pct"] = max(atr_pct, 2.2)
+
+    elif profile == "selloff":
+        t["price"] = round(price * 0.975, 2)
+        if sma20 is not None:
+            t["sma20"] = round(max(t["price"] * 1.01, sma20 * 0.998), 2)
+        if sma50 is not None:
+            t["sma50"] = round(max((t.get("sma20") or sma50) * 0.995, sma50 * 0.999), 2)
+        if rsi14 is not None:
+            t["rsi14"] = max(18.0, rsi14 - 10.0)
+        if volume_ratio is not None:
+            t["volume_ratio"] = max(1.6, volume_ratio)
+        else:
+            t["volume_ratio"] = 1.6
+        if momentum_20 is not None:
+            t["momentum_20"] = momentum_20 - 5.0
+        if momentum_60 is not None:
+            t["momentum_60"] = momentum_60 - 7.0
+        if atr_pct is not None:
+            t["atr_pct"] = max(atr_pct, 2.5)
+
+    elif profile == "choppy":
+        t["price"] = round(price * 1.003, 2)
+        if rsi14 is not None:
+            t["rsi14"] = min(75.0, max(25.0, rsi14 + 2.0))
+        if volume_ratio is not None:
+            t["volume_ratio"] = max(1.1, volume_ratio)
+
+    elif profile == "flat":
+        pass
+
+    log.warning("[technicals][SIM] %s profile=%s price=%s", symbol, profile, t.get("price"))
+    return t
+
+
 def build_technical_snapshot(symbol: str):
     """
     Returnerar technicals-dict för symbolen.
@@ -253,7 +330,10 @@ def build_technical_snapshot(symbol: str):
     """
     df = fetch_price_history(symbol, period="6mo", interval="1d")
     if df is None or df.empty:
-        return _empty_snapshot()
+        snapshot = _empty_snapshot()
+        if _sim_enabled():
+            return _apply_simulation(symbol, snapshot)
+        return snapshot
 
     close = df["Close"]
     volume = df["Volume"]
@@ -281,7 +361,7 @@ def build_technical_snapshot(symbol: str):
     if price not in (None, 0) and avg_volume_20 not in (None, 0):
         avg_dollar_volume_20 = price * avg_volume_20
 
-    return {
+    snapshot = {
         "price": price,
         "sma20": sma20,
         "sma50": sma50,
@@ -295,3 +375,8 @@ def build_technical_snapshot(symbol: str):
         "momentum_20": momentum_20,
         "momentum_60": momentum_60,
     }
+
+    if _sim_enabled():
+        return _apply_simulation(symbol, snapshot)
+
+    return snapshot

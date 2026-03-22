@@ -110,6 +110,11 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     log_universe = LOG_UNIVERSE
     debug_autotrade = DEBUG_AUTOTRADE
 
+    sim_market = os.getenv("SIM_MARKET", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if sim_market:
+        autotrade_enabled = False
+        log.warning("[autoscan][SIM] Fake market mode aktivt – AUTOTRADE tvingas OFF")
+
     entry_mode = os.getenv("ENTRY_MODE", "buy_only").strip().lower()  # buy_only | all
     only_trade_on_signal_change = _env_bool("ONLY_TRADE_ON_SIGNAL_CHANGE", True)
     cooldown_min = _env_int("COOLDOWN_MIN", 30)
@@ -232,6 +237,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     removed_this_pass = set()
     orders_buy = 0
     orders_sell = 0
+    paper_buy = 0
+    paper_sell = 0
+    paper_symbols = []
 
     rotations_out = []
     rotations_in = []
@@ -338,6 +346,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         analysis_row["symbol"] = sym
         analysis_row["name"] = raw.get("name") or raw.get("companyName") or sym
         scan_results.append(analysis_row)
+       
+        prev_sig = state["last_signal"].get(sym)
+
+
 
         append_event(
             "signal_evaluated",
@@ -350,7 +362,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             },
         )
 
-        if signal == "Köp":
+        if signal == "Köp" and prev_sig != "Köp":
             append_event(
                 "buy_signal",
                 symbol=sym,
@@ -371,7 +383,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             update_signal_state(state, sym, signal)
             continue
 
-        prev_sig = state["last_signal"].get(sym)
         drop_reason = None
         hold_streak = int(state.get("hold_streak", {}).get(sym, 0))
         effective_hold_streak = hold_streak + 1 if signal == "Håll" else 0
@@ -381,12 +392,21 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 drop_reason = f"ersätt pga {signal}"
 
         elif entry_mode == "all":
-            if signal == "Håll" and effective_hold_streak >= DROP_IF_HOLD_STREAK:
+            if market_ok and signal == "Håll" and effective_hold_streak >= DROP_IF_HOLD_STREAK:
                 drop_reason = f"ersätt pga Håll-streak={effective_hold_streak}"
 
         if drop_reason:
+            candidate_scan = [s for s in scan_set if s != sym]
+            repl = _take_replacement(candidate_scan, banned=removed_this_pass)
+
+            if not repl:
+                log.info("[KEEP] %s → %s men ingen ersättare finns", sym, drop_reason)
+                update_signal_state(state, sym, signal)
+                continue
+
             if sym in scan_set:
                 scan_set.remove(sym)
+
             removed.append(sym)
             removed_this_pass.add(sym)
 
@@ -409,28 +429,26 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=pass_ex_min)).isoformat()
             reset_symbol_rotation_state(state, sym)
 
-            repl = _take_replacement(scan_set, banned=removed_this_pass)
-            if repl:
-                scan_set.append(repl)
-                scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
-                added.append(repl)
-                log.info("[ADD] %s → ersätter %s", repl, sym)
+            scan_set.append(repl)
+            scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
+            added.append(repl)
+            log.info("[ADD] %s → ersätter %s", repl, sym)
 
-                repl_raw = by_sym.get(repl) or {}
-                rotations_in.append({
-                    "symbol": repl,
-                    "name": repl_raw.get("name") or repl_raw.get("companyName") or repl,
-                })
+            repl_raw = by_sym.get(repl) or {}
+            rotations_in.append({
+                "symbol": repl,
+                "name": repl_raw.get("name") or repl_raw.get("companyName") or repl,
+            })
 
-                append_event(
-                    "rotation_in",
-                    symbol=repl,
-                    name=repl_raw.get("name") or repl_raw.get("companyName") or repl,
-                    reason=f"replaced {sym}",
-                )
+            append_event(
+                "rotation_in",
+                symbol=repl,
+                name=repl_raw.get("name") or repl_raw.get("companyName") or repl,
+                reason=f"replaced {sym}",
+            )
 
             continue
-
+            
         if only_trade_on_signal_change and prev_sig == signal:
             log.info("[KEEP] %s → ingen signaländring", sym)
             update_signal_state(state, sym, signal)
@@ -571,16 +589,53 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             else:
                 log.info("[SKIP] %s → duplicerad ordernyckel", sym)
         else:
-            if debug_autotrade:
-                why = []
-                if not autotrade_enabled:
-                    why.append("AUTOTRADE=off")
-                if not risk_ok:
-                    why.append("risk")
-                if not market_ok:
-                    why.append("market_closed")
-                if _in_cooldown(sym):
-                    why.append("cooldown")
+            why = []
+            if not autotrade_enabled:
+                why.append("AUTOTRADE=off")
+            if not risk_ok:
+                why.append("risk")
+            if not market_ok:
+                why.append("market_closed")
+            if _in_cooldown(sym):
+                why.append("cooldown")
+
+            if signal in {"Köp", "Sälj"}:
+                if signal == "Köp":
+                    paper_buy += 1
+                elif signal == "Sälj":
+                    paper_sell += 1
+
+                paper_symbols.append(f"{signal}:{sym}")
+
+                log.warning(
+                    "[PAPER-SIM] HADE %s %s x%d | sim_price=%s score=%s (%s)",
+                    signal.upper(),
+                    sym,
+                    qty,
+                    raw_technicals.get("price"),
+                    analysis.get("total_score"),
+                    ",".join(why) or "-",
+                )
+
+                append_event(
+                    "paper_signal",
+                    symbol=sym,
+                    name=raw.get("name") or raw.get("companyName") or sym,
+                    data={
+                        "signal": signal,
+                        "qty": qty,
+                        "reason": ",".join(why) or "-",
+                        "score": analysis.get("total_score"),
+                        "price": raw_technicals.get("price"),
+                    },
+                )
+
+                orders_for_report.append(
+                    f"PAPER-SIM: skulle {signal.lower()} {sym} x{qty} "
+                    f"(price={raw_technicals.get('price')}, score={analysis.get('total_score')}, {','.join(why) or '-'})"
+                )
+              
+            elif debug_autotrade:
                 log.info("[SIM] %s %s x%d (%s)", signal.upper(), sym, qty, ",".join(why) or "-")
 
             log.info("[KEEP] %s → ingen verklig order, behålls i universe", sym)
@@ -632,9 +687,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             "Autoscan klar",
             f"• Aktier (i scan): {len(scan_set)}",
             f"• Ordrar: Köp {orders_buy} · Sälj {orders_sell}",
+            f"• Paper-sim: Köp {paper_buy} · Sälj {paper_sell}",
             f"• Byten: + {add_txt}  |  − {rem_txt}",
         ]
         await bot.send_message(admin_chat_id, "\n".join(msg))
+
+    if paper_symbols:
+        log.warning("[PAPER-SUMMARY] %s", ", ".join(paper_symbols))
 
     if log_universe:
         log.info(

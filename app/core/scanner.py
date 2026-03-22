@@ -274,8 +274,15 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
 async def ensure_stock_info(ib_client=None, min_count: int = 10) -> list[dict]:
     data = _read_stock_info()
-    if isinstance(data, list) and len(data) >= max(4, min_count // 2):
+    minimum_usable = max(10, min(min_count, 30))
+
+    if isinstance(data, list) and len(data) >= minimum_usable:
         return data
-    log.info("[scanner] Stock_info.json saknas/korrupt/otillräcklig – bygger om…")
+
+    log.info(
+        "[scanner] Stock_info.json saknas/korrupt/otillräcklig (%s/%s) – bygger om…",
+        len(data) if isinstance(data, list) else 0,
+        minimum_usable,
+    )
     data = await refresh_stock_info(ib_client=ib_client, limit=min_count)
     return data or []
