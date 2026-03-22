@@ -14,13 +14,14 @@ from app.config import (
     DROP_IF_HOLD_STREAK,
     LOG_UNIVERSE,
     SIGNAL_LOG_PATH,
-    STOCK_INFO_PATH,
     SUMMARY_NOTIFS,
     UNIVERSE_ROWS,
 )
+
 from app.core.helpers import is_dup, kill_switch_ok, market_open_now
-from app.core.scanner import ensure_stock_info
-from app.core.signals import execute_order, get_signal_analysis
+from app.config import FINAL_CANDIDATES_PATH
+from app.core.pipeline import run_pipeline
+from app.core.signals import execute_order
 from app.core.storage_utils import append_event, save_daily_report, save_daily_snapshot
 from app.core.universe_manager import (
     load_state,
@@ -163,11 +164,6 @@ def trim_jsonl(path: str, keep_last: int = 5000):
         with p.open("w", encoding="utf-8") as f:
             f.writelines(lines[-keep_last:])
 
-
-async def _call_ensure_stock_info(ib_client, rows_target: int):
-    return await ensure_stock_info(ib_client, min_count=rows_target)
-
-
 def _dedupe_keep_order(items):
     seen = set()
     out = []
@@ -180,6 +176,27 @@ def _dedupe_keep_order(items):
         seen.add(item)
         out.append(item)
     return out
+
+
+def _build_pipeline_analysis(stock: dict) -> dict:
+    sym = (stock.get("symbol") or "").upper().strip()
+
+    pipeline_signal = stock.get("_pipeline_signal") or "Håll"
+    pipeline_score = stock.get("_pipeline_final_score", 0)
+    pipeline_technicals = stock.get("_pipeline_technicals") or {}
+    pipeline_scores = stock.get("_pipeline_scores") or {}
+    pipeline_score_details = stock.get("_pipeline_score_details") or {}
+
+    return {
+        "symbol": sym,
+        "signal": pipeline_signal,
+        "total_score": pipeline_score,
+        "raw_technicals": pipeline_technicals,
+        "pipeline_scores": pipeline_scores,
+        "pipeline_score_details": pipeline_score_details,
+        "timestamp": _now_utc().isoformat(),
+    }
+
 
 
 async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
@@ -226,18 +243,17 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         log.warning("IB inte ansluten – autoscan avbruten.")
         return
 
-    rows_target = max(universe_rows * candidate_mult, universe_rows)
     try:
-        await _call_ensure_stock_info(ib_client, rows_target)
+        pipeline_snapshot = await run_pipeline(ib_client)
     except Exception as e:
-        log.error("[autoscan] Kunde inte kalla ensure_stock_info: %s", e)
+        log.error("[autoscan] Kunde inte köra pipeline: %s", e)
         return
 
     try:
-        with open(STOCK_INFO_PATH, "r", encoding="utf-8") as f:
+        with open(FINAL_CANDIDATES_PATH, "r", encoding="utf-8") as f:
             universe = json.load(f)
     except Exception as e:
-        log.error("[autoscan] Kunde inte läsa %s: %s", STOCK_INFO_PATH, e)
+        log.error("[autoscan] Kunde inte läsa %s: %s", FINAL_CANDIDATES_PATH, e)
         return
 
     positions = await ib_client.ib.reqPositionsAsync()
@@ -262,6 +278,12 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         }
     except Exception:
         open_buy_syms = set()
+    
+    log.info(
+        "[autoscan] HELD=%s | OPEN_BUYS=%s",
+        sorted(list(held.keys())),
+        sorted(list(open_buy_syms)),
+    )
 
     state = load_state()
     state.setdefault("last_signal", {})
@@ -299,7 +321,27 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         except Exception:
             return False
 
-    by_sym = {(s.get("symbol") or "").upper(): s for s in universe if s.get("symbol")}
+    by_sym = {}
+    for s in universe:
+        sym = (s.get("symbol") or "").upper().strip()
+        if not sym:
+            continue
+
+        stock = dict(s.get("stock") or {})
+        stock["symbol"] = sym
+        stock["name"] = s.get("name") or stock.get("name") or sym
+        stock["_pipeline_signal"] = s.get("signal")
+        stock["_pipeline_final_score"] = s.get("final_score")
+        stock["_pipeline_technicals"] = s.get("technicals") or {}
+        stock["_pipeline_scores"] = s.get("scores") or {}
+        stock["_pipeline_score_details"] = s.get("score_details") or {}
+
+        by_sym[sym] = stock
+
+    log.info(
+        "[autoscan] FINAL symbols=%s",
+        sorted(list(by_sym.keys())),
+    )
 
     all_candidates = [
         s for s in by_sym.keys()
@@ -316,20 +358,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         key=lambda s: _to_float((by_sym.get(s) or {}).get("latestClose"), 999999)
     )
 
-    max_scan_price = _env_int("MAX_SCAN_PRICE", 150)
-
-    all_candidates = [
-        s for s in all_candidates
-        if _to_float((by_sym.get(s) or {}).get("latestClose"), 999999) <= max_scan_price
-    ]
-
-    if len(all_candidates) < universe_rows:
-        log.warning(
-            "[autoscan] För få kandidater efter MAX_SCAN_PRICE=%s (%d kvar för target=%d)",
-            max_scan_price,
-            len(all_candidates),
-            universe_rows,
-    )
 
     prev_uni = [s.upper() for s in state.get("universe", []) if s]
     scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, all_candidates, state)
@@ -430,9 +458,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         stock = _normalize_stock(raw)
 
         try:
-            analysis = get_signal_analysis(stock)
+            analysis = _build_pipeline_analysis(stock)
             signal = analysis["signal"]
-            analysis["timestamp"] = _now_utc().isoformat()
 
             with open(str(SIGNAL_LOG_PATH), "a", encoding="utf-8") as f:
                 f.write(json.dumps(analysis, ensure_ascii=False) + "\n")
@@ -447,6 +474,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 "error": str(e),
                 "timestamp": _now_utc().isoformat(),
             }
+                
 
         raw_technicals = analysis.get("raw_technicals") or {}
 

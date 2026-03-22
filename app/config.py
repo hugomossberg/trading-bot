@@ -40,6 +40,8 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH = Path(os.getenv("STATE_PATH", str(STATE_DIR / "trade_state.json")))
 SIGNAL_LOG_PATH = Path(os.getenv("SIGNAL_LOG_PATH", str(STATE_DIR / "signal_log.json")))
 STOCK_INFO_PATH = Path(os.getenv("STOCK_INFO_PATH", str(STATE_DIR / "stock_info.json")))
+PIPELINE_SNAPSHOT_PATH = Path(os.getenv("PIPELINE_SNAPSHOT_PATH", str(STATE_DIR / "pipeline_snapshot.json")))
+FINAL_CANDIDATES_PATH = Path(os.getenv("FINAL_CANDIDATES_PATH", str(STATE_DIR / "final_candidates.json")))
 
 # ===== Env config =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
