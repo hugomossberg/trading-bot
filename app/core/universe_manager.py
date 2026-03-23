@@ -1,4 +1,3 @@
-#universe_manager.py
 import os
 import json
 from datetime import datetime, timezone
@@ -45,7 +44,20 @@ def _is_excluded(state, sym: str) -> bool:
     return dt > _now_utc()
 
 
-def load_state(): 
+def _default_exit_state():
+    return {
+        "stage": 0,
+        "bearish_count": 0,
+        "last_action": "hold",
+        "last_score": 0,
+        "last_retention_score": 0,
+        "last_timing_state": "unknown",
+        "soft_exit_done": False,
+        "updated_at": None,
+    }
+
+
+def load_state():
     state = {
         "hold_streak": {},
         "last_signal": {},
@@ -54,6 +66,8 @@ def load_state():
         "buys_today": {},
         "sells_today": {},
         "exclude_until": {},
+        "watchlist": [],
+        "exit_state": {},
     }
 
     if os.path.exists(STATE_PATH):
@@ -72,8 +86,52 @@ def load_state():
     state.setdefault("buys_today", {})
     state.setdefault("sells_today", {})
     state.setdefault("exclude_until", {})
+    state.setdefault("watchlist", [])
+    state.setdefault("exit_state", {})
 
     state["universe"] = _dedupe_keep_order(state.get("universe", []))
+
+    if not isinstance(state.get("exit_state"), dict):
+        state["exit_state"] = {}
+
+    normalized_exit_state = {}
+    for sym, data in state["exit_state"].items():
+        sym_up = str(sym).upper().strip()
+        if not sym_up:
+            continue
+
+        base = _default_exit_state()
+        if isinstance(data, dict):
+            base.update(data)
+
+        try:
+            base["stage"] = int(base.get("stage", 0) or 0)
+        except Exception:
+            base["stage"] = 0
+
+        try:
+            base["bearish_count"] = int(base.get("bearish_count", 0) or 0)
+        except Exception:
+            base["bearish_count"] = 0
+
+        try:
+            base["last_score"] = int(base.get("last_score", 0) or 0)
+        except Exception:
+            base["last_score"] = 0
+
+        try:
+            base["last_retention_score"] = int(base.get("last_retention_score", 0) or 0)
+        except Exception:
+            base["last_retention_score"] = 0
+
+        base["last_action"] = str(base.get("last_action", "hold") or "hold").strip().lower()
+        base["last_timing_state"] = str(base.get("last_timing_state", "unknown") or "unknown").strip().lower()
+        base["soft_exit_done"] = bool(base.get("soft_exit_done", False))
+        base["updated_at"] = base.get("updated_at")
+
+        normalized_exit_state[sym_up] = base
+
+    state["exit_state"] = normalized_exit_state
 
     return state
 
@@ -95,18 +153,91 @@ def update_signal_state(state, sym: str, signal: str):
     state.setdefault("hold_streak", {})
     state.setdefault("last_signal", {})
 
+    prev_signal = state["last_signal"].get(sym)
+
     if signal == "Håll":
-        state["hold_streak"][sym] = int(state["hold_streak"].get(sym, 0)) + 1
+        if prev_signal == "Håll":
+            state["hold_streak"][sym] = int(state["hold_streak"].get(sym, 0)) + 1
+        else:
+            state["hold_streak"][sym] = 1
     else:
         state["hold_streak"][sym] = 0
 
     state["last_signal"][sym] = signal
 
 
+def get_exit_state(state, sym: str) -> dict:
+    sym = str(sym).upper().strip()
+    if not sym:
+        return _default_exit_state()
+
+    state.setdefault("exit_state", {})
+
+    current = state["exit_state"].get(sym)
+    if not isinstance(current, dict):
+        current = _default_exit_state()
+        state["exit_state"][sym] = current
+        return current
+
+    merged = _default_exit_state()
+    merged.update(current)
+    state["exit_state"][sym] = merged
+    return merged
+
+
+def set_exit_state(state, sym: str, exit_state: dict):
+    sym = str(sym).upper().strip()
+    if not sym:
+        return
+
+    state.setdefault("exit_state", {})
+
+    merged = _default_exit_state()
+    if isinstance(exit_state, dict):
+        merged.update(exit_state)
+
+    try:
+        merged["stage"] = int(merged.get("stage", 0) or 0)
+    except Exception:
+        merged["stage"] = 0
+
+    try:
+        merged["bearish_count"] = int(merged.get("bearish_count", 0) or 0)
+    except Exception:
+        merged["bearish_count"] = 0
+
+    try:
+        merged["last_score"] = int(merged.get("last_score", 0) or 0)
+    except Exception:
+        merged["last_score"] = 0
+
+    try:
+        merged["last_retention_score"] = int(merged.get("last_retention_score", 0) or 0)
+    except Exception:
+        merged["last_retention_score"] = 0
+
+    merged["last_action"] = str(merged.get("last_action", "hold") or "hold").strip().lower()
+    merged["last_timing_state"] = str(merged.get("last_timing_state", "unknown") or "unknown").strip().lower()
+    merged["soft_exit_done"] = bool(merged.get("soft_exit_done", False))
+    merged["updated_at"] = merged.get("updated_at") or _now_utc().isoformat()
+
+    state["exit_state"][sym] = merged
+
+
+def reset_exit_state(state, sym: str):
+    sym = str(sym).upper().strip()
+    if not sym:
+        return
+
+    state.setdefault("exit_state", {})
+    state["exit_state"].pop(sym, None)
+
+
 def reset_symbol_rotation_state(state, sym: str):
     """
     Nollställ rotationshistorik för en symbol när den lämnar universe.
-    Viktigt för att symbolen inte ska komma tillbaka med gammal hold_streak.
+    Viktigt för att symbolen inte ska komma tillbaka med gammal hold_streak
+    eller gammalt exit-state.
     """
     sym = str(sym).upper().strip()
     if not sym:
@@ -114,9 +245,11 @@ def reset_symbol_rotation_state(state, sym: str):
 
     state.setdefault("hold_streak", {})
     state.setdefault("last_signal", {})
+    state.setdefault("exit_state", {})
 
     state["hold_streak"].pop(sym, None)
     state["last_signal"].pop(sym, None)
+    state["exit_state"].pop(sym, None)
 
 
 def rotate_universe(prev_uni, candidates, state):
@@ -124,7 +257,7 @@ def rotate_universe(prev_uni, candidates, state):
     Bygger ett stabilt universe.
 
     Viktigt:
-    - Den här funktionen ska INTE längre fatta beslut om hold-streak-drop.
+    - Den här funktionen ska INTE fatta beslut om hold-streak-drop.
       Det ska autoscan.py göra.
     - Den här funktionen ska bara:
         1) behålla så mycket som möjligt av tidigare universe
@@ -134,7 +267,7 @@ def rotate_universe(prev_uni, candidates, state):
 
     Returnerar:
     - new_uni
-    - dropped (sådant som försvann pga ej längre kandidat / exclude / target-limit)
+    - dropped
     - added
     """
 
@@ -143,6 +276,7 @@ def rotate_universe(prev_uni, candidates, state):
     state.setdefault("last_signal", {})
     state.setdefault("universe", [])
     state.setdefault("exclude_until", {})
+    state.setdefault("exit_state", {})
 
     prefer_non_hold = os.getenv("PREFER_NON_HOLD", "1").lower() in {"1", "true", "yes", "on"}
 

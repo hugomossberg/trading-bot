@@ -107,10 +107,19 @@ def evaluate_liquidity(technicals):
     return liquidity_value, details
 
 
-def analyze_stock(stock_data):
+def analyze_stock(stock_data, include_news: bool = True):
     fundamentals_score, fundamentals_details = evaluate_fundamentals(stock_data)
     financials_score, financials_details = evaluate_financials(stock_data)
-    news_score_value, news_details = evaluate_news(stock_data)
+
+    if include_news:
+        news_score_value, news_details = evaluate_news(stock_data)
+    else:
+        news_score_value, news_details = 0, {
+            "news_sentiment_score": 0,
+            "raw_sentiment": 0.0,
+            "skipped": True,
+        }
+
     technicals_score, technicals_details, technicals_raw = evaluate_technicals(stock_data)
     liquidity_score, liquidity_details = evaluate_liquidity(technicals_raw)
 

@@ -5,7 +5,6 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
 from app.config import EVENTS_DIR, REPORTS_DIR, SNAPSHOT_DIR
 
 
@@ -99,6 +98,7 @@ def save_daily_snapshot(
     summary: dict | None = None,
     scan_set: list[dict] | None = None,
     market_open: bool | None = None,
+    portfolio: list[dict] | None = None,
 ) -> Path:
     dt = now_utc()
     path = get_snapshot_path(dt)
@@ -109,11 +109,28 @@ def save_daily_snapshot(
         "market_open": market_open,
         "summary": deepcopy(summary or {}),
         "scan_set": deepcopy(scan_set or []),
+        "portfolio": deepcopy(portfolio or []),
         "state": deepcopy(state or {}),
     }
 
     atomic_json_write(path, payload)
     return path
+
+
+def save_portfolio_review(rows: list[dict], dt: datetime | None = None) -> Path:
+    dt = dt or now_utc()
+    path = SNAPSHOT_DIR / year_folder(dt) / week_folder(dt)
+    path.mkdir(parents=True, exist_ok=True)
+    file_path = path / (dt.strftime("%Y-%m-%d") + "_portfolio.json")
+
+    payload = {
+        "snapshot_ts": dt.isoformat(),
+        "portfolio": deepcopy(rows or []),
+    }
+
+    atomic_json_write(file_path, payload)
+    return file_path
+
 
 
 def _signal_label(signal: str) -> str:

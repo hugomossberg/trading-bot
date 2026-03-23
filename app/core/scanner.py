@@ -1,6 +1,7 @@
 #scanner.py
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,6 +13,13 @@ log = logging.getLogger("scanner")
 md = MarketDataService()
 
 _STOCK_INFO_MAX_AGE_MIN = 60
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
 
 
 def _to_float(x, default=None):
@@ -134,6 +142,10 @@ def _screen_filters(limit: int) -> dict:
     if min_market_cap:
         filters["marketCapMoreThan"] = int(min_market_cap)
 
+    max_scan_price = _env_int("MAX_SCAN_PRICE", 0)
+    if max_scan_price > 0:
+        filters["priceLowerThan"] = max_scan_price
+
     if PROFILE["currency"] == "SEK" or MARKET_PROFILE == "SE":
         filters["country"] = "SE"
     else:
@@ -200,8 +212,12 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
     rows: list[dict] = []
 
-    target_rows = min(max(limit * 5, 80), 150)
-    full_fetch_limit = min(max(limit + 60, 120), 150)
+    target_rows_default = min(max(limit * 5, 80), 150)
+    full_fetch_limit_default = min(max(limit + 60, 120), 150)
+
+    target_rows = _env_int("SCANNER_TARGET_ROWS", target_rows_default)
+    full_fetch_limit = _env_int("SCANNER_FETCH_LIMIT", full_fetch_limit_default)
+
     selected = tickers[:full_fetch_limit]
 
     log.info(
@@ -255,7 +271,9 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
                 fundamentals = {}
 
             try:
-                if i <= 30:
+                financials_limit = _env_int("SCANNER_FINANCIALS_LIMIT", 30)
+
+                if i <= financials_limit:
                     financials = md.get_financials(sym)
                 else:
                     financials = {}
@@ -267,8 +285,11 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
             stock.update(financials)
 
             try:
-                if i <= 20:
-                    news_items = md.get_stock_news(sym, limit=3) or []
+                news_fetch_limit = _env_int("SCANNER_NEWS_FETCH_LIMIT", 20)
+                news_items_per_symbol = _env_int("SCANNER_NEWS_ITEMS", 3)
+
+                if i <= news_fetch_limit:
+                    news_items = md.get_stock_news(sym, limit=news_items_per_symbol) or []
                 else:
                     news_items = []
 
