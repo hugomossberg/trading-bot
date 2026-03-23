@@ -1,15 +1,13 @@
-#techincals.py
 import math
+import os
 import time
 import logging
-from typing import Optional
-
-import os
 from copy import deepcopy
+from typing import Optional
 
 import pandas as pd
 
-from app.core.market_profile import PROFILE, MARKET_PROFILE
+from app.core.market_profile import MARKET_PROFILE
 
 log = logging.getLogger("technicals")
 
@@ -17,17 +15,31 @@ _HISTORY_CACHE = {}
 _HISTORY_TTL_SEC = 60
 _IB_CLIENT = None
 
+# Kända problem-/döda symboler som bara skapar Error 200 / brus i IB
+_INVALID_IB_SYMBOLS = {
+    "CCIV",
+    "TWTR",
+    "NETE",
+}
+
+# Symboler som behöver mappas för IB-kontrakt
+_IB_SYMBOL_MAP = {
+    "BRK-B": "BRK B",
+}
+
+# Undvik att spamma samma sim-logg hela tiden
+_LAST_SIM_LOG = {}
+
+
 def _sim_enabled() -> bool:
     return os.getenv("SIM_MARKET", "0").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _sim_profile() -> str:
     return os.getenv("SIM_PROFILE", "flat").strip().lower()
 
 
 def set_ib_client(ib_client):
-    """
-    Sätts från appen vid startup efter att IB kopplat upp.
-    """
     global _IB_CLIENT
     _IB_CLIENT = ib_client
 
@@ -41,6 +53,19 @@ def _safe_float(value, default=None):
         return float(value)
     except Exception:
         return default
+
+
+def _normalize_symbol(symbol: str) -> str:
+    return (symbol or "").upper().strip()
+
+
+def _should_skip_ib_symbol(symbol: str) -> bool:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        return True
+    if sym in _INVALID_IB_SYMBOLS:
+        return True
+    return False
 
 
 def _period_to_ib_duration(period: str) -> str:
@@ -73,18 +98,21 @@ def _build_contract(symbol: str):
         log.warning("[technicals] Kunde inte importera ib_insync Stock: %s", e)
         return None
 
-    symbol = (symbol or "").upper().strip()
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        return None
+
+    if _should_skip_ib_symbol(sym):
+        return None
 
     if MARKET_PROFILE == "SE":
-        base_symbol = symbol.replace(".ST", "")
+        base_symbol = sym.replace(".ST", "")
+        if not base_symbol:
+            return None
         return Stock(base_symbol, "SMART", "SEK")
 
-    ib_symbol_map = {
-        "BRK-B": "BRK B",
-    }
-
-    symbol = ib_symbol_map.get(symbol, symbol)
-    return Stock(symbol, "SMART", "USD")
+    mapped_symbol = _IB_SYMBOL_MAP.get(sym, sym)
+    return Stock(mapped_symbol, "SMART", "USD")
 
 
 def _bars_to_df(bars):
@@ -93,14 +121,16 @@ def _bars_to_df(bars):
 
     rows = []
     for bar in bars:
-        rows.append({
-            "Date": getattr(bar, "date", None),
-            "Open": _safe_float(getattr(bar, "open", None)),
-            "High": _safe_float(getattr(bar, "high", None)),
-            "Low": _safe_float(getattr(bar, "low", None)),
-            "Close": _safe_float(getattr(bar, "close", None)),
-            "Volume": _safe_float(getattr(bar, "volume", None)),
-        })
+        rows.append(
+            {
+                "Date": getattr(bar, "date", None),
+                "Open": _safe_float(getattr(bar, "open", None)),
+                "High": _safe_float(getattr(bar, "high", None)),
+                "Low": _safe_float(getattr(bar, "low", None)),
+                "Close": _safe_float(getattr(bar, "close", None)),
+                "Volume": _safe_float(getattr(bar, "volume", None), 0.0),
+            }
+        )
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -111,7 +141,12 @@ def _bars_to_df(bars):
         if col not in df.columns:
             df[col] = None
 
-    return df
+    # Rensa bort helt trasiga rader
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        return None
+
+    return df.reset_index(drop=True)
 
 
 def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
@@ -120,7 +155,8 @@ def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
     Returnerar pandas DataFrame eller None.
     Cachar kortvarigt för att minska upprepade anrop.
     """
-    cache_key = (symbol, period, interval)
+    sym = _normalize_symbol(symbol)
+    cache_key = (sym, period, interval)
     now = time.time()
 
     cached = _HISTORY_CACHE.get(cache_key)
@@ -129,19 +165,23 @@ def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
         if now - ts < _HISTORY_TTL_SEC:
             return df
 
+    if _should_skip_ib_symbol(sym):
+        _HISTORY_CACHE[cache_key] = (now, None)
+        return None
+
     if _IB_CLIENT is None or not getattr(_IB_CLIENT, "ib", None):
-        log.warning("[technicals] IB client saknas för %s", symbol)
+        log.warning("[technicals] IB client saknas för %s", sym)
         _HISTORY_CACHE[cache_key] = (now, None)
         return None
 
     try:
         ib = _IB_CLIENT.ib
         if not ib.isConnected():
-            log.warning("[technicals] IB ej ansluten för %s", symbol)
+            log.warning("[technicals] IB ej ansluten för %s", sym)
             _HISTORY_CACHE[cache_key] = (now, None)
             return None
 
-        contract = _build_contract(symbol)
+        contract = _build_contract(sym)
         if contract is None:
             _HISTORY_CACHE[cache_key] = (now, None)
             return None
@@ -162,7 +202,7 @@ def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
 
         df = _bars_to_df(bars)
         if df is None or df.empty:
-            log.warning("[technicals] Ingen IB-prisdata för %s", symbol)
+            log.warning("[technicals] Ingen IB-prisdata för %s", sym)
             _HISTORY_CACHE[cache_key] = (now, None)
             return None
 
@@ -170,7 +210,7 @@ def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
         return df
 
     except Exception as e:
-        log.warning("[technicals] IB historical fail för %s: %s", symbol, e)
+        log.warning("[technicals] IB historical fail för %s: %s", sym, e)
         _HISTORY_CACHE[cache_key] = (now, None)
         return None
 
@@ -256,6 +296,17 @@ def _empty_snapshot():
     }
 
 
+def _log_sim_once(symbol: str, profile: str, price):
+    key = _normalize_symbol(symbol)
+    payload = (profile, price)
+
+    if _LAST_SIM_LOG.get(key) == payload:
+        return
+
+    _LAST_SIM_LOG[key] = payload
+    if os.getenv("DEBUG_SIM_TECHNICALS", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        log.info("[technicals] Simulerar technicals för %s med profil %s, pris ~%s", symbol, profile, price)
+
 def _apply_simulation(symbol: str, technicals: dict) -> dict:
     t = deepcopy(technicals or {})
     profile = _sim_profile()
@@ -269,6 +320,7 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
     momentum_60 = _safe_float(t.get("momentum_60"))
     atr_pct = _safe_float(t.get("atr_pct"))
 
+    # Om ingen riktig price finns, simulera inte fram skräp
     if price is None:
         return t
 
@@ -280,10 +332,7 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
             t["sma50"] = round(min((t.get("sma20") or sma50) * 0.995, sma50 * 1.002), 2)
         if rsi14 is not None:
             t["rsi14"] = min(82.0, rsi14 + 8.0)
-        if volume_ratio is not None:
-            t["volume_ratio"] = max(1.8, volume_ratio)
-        else:
-            t["volume_ratio"] = 1.8
+        t["volume_ratio"] = max(1.8, volume_ratio) if volume_ratio is not None else 1.8
         if momentum_20 is not None:
             t["momentum_20"] = momentum_20 + 4.0
         if momentum_60 is not None:
@@ -299,10 +348,7 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
             t["sma50"] = round(max((t.get("sma20") or sma50) * 0.995, sma50 * 0.999), 2)
         if rsi14 is not None:
             t["rsi14"] = max(18.0, rsi14 - 10.0)
-        if volume_ratio is not None:
-            t["volume_ratio"] = max(1.6, volume_ratio)
-        else:
-            t["volume_ratio"] = 1.6
+        t["volume_ratio"] = max(1.6, volume_ratio) if volume_ratio is not None else 1.6
         if momentum_20 is not None:
             t["momentum_20"] = momentum_20 - 5.0
         if momentum_60 is not None:
@@ -320,7 +366,7 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
     elif profile == "flat":
         pass
 
-    log.warning("[technicals][SIM] %s profile=%s price=%s", symbol, profile, t.get("price"))
+    _log_sim_once(symbol, profile, t.get("price"))
     return t
 
 
@@ -329,11 +375,15 @@ def build_technical_snapshot(symbol: str):
     Returnerar technicals-dict för symbolen.
     Returnerar alltid en dict, aldrig {}.
     """
-    df = fetch_price_history(symbol, period="6mo", interval="1d")
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        return _empty_snapshot()
+
+    df = fetch_price_history(sym, period="6mo", interval="1d")
     if df is None or df.empty:
         snapshot = _empty_snapshot()
         if _sim_enabled():
-            return _apply_simulation(symbol, snapshot)
+            return _apply_simulation(sym, snapshot)
         return snapshot
 
     close = df["Close"]
@@ -378,6 +428,6 @@ def build_technical_snapshot(symbol: str):
     }
 
     if _sim_enabled():
-        return _apply_simulation(symbol, snapshot)
+        return _apply_simulation(sym, snapshot)
 
     return snapshot

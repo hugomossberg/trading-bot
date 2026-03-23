@@ -1,4 +1,3 @@
-#scanner.py
 import json
 import logging
 import os
@@ -13,6 +12,7 @@ log = logging.getLogger("scanner")
 md = MarketDataService()
 
 _STOCK_INFO_MAX_AGE_MIN = 60
+_BAD_IB_SYMBOLS = {"CCIV", "TWTR", "NETE"}
 
 
 def _env_int(key: str, default: int) -> int:
@@ -235,6 +235,10 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
     for i, sym in enumerate(selected, start=1):
         try:
+            if sym in _BAD_IB_SYMBOLS:
+                log.info("[scanner] SKIP  %3d/%d %-6s | blacklist/ogiltig hos IB", i, len(selected), sym)
+                continue
+
             quote = quotes.get(sym) or {}
             if not quote:
                 try:
@@ -272,7 +276,6 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
             try:
                 financials_limit = _env_int("SCANNER_FINANCIALS_LIMIT", 30)
-
                 if i <= financials_limit:
                     financials = md.get_financials(sym)
                 else:
@@ -284,62 +287,7 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
             stock = _build_stock_row(sym, quote, profile, fundamentals, financials)
             stock.update(financials)
 
-            try:
-                news_fetch_limit = _env_int("SCANNER_NEWS_FETCH_LIMIT", 20)
-                news_items_per_symbol = _env_int("SCANNER_NEWS_ITEMS", 3)
-
-                if i <= news_fetch_limit:
-                    news_items = md.get_stock_news(sym, limit=news_items_per_symbol) or []
-                else:
-                    news_items = []
-
-                stock["News"] = [
-                    {
-                        "content": {
-                            "title": n.get("title", ""),
-                            "summary": n.get("text", "") or "",
-                            "publisher": n.get("publisher") or n.get("site", ""),
-                            "link": n.get("url", ""),
-                        }
-                    }
-                    for n in news_items
-                ]
-            except Exception as e:
-                log.warning("[scanner] FETCH %3d/%d %-6s | news fail: %s", i, len(selected), sym, e)
-                stock["News"] = []
-
-            if i <= 20:
-                log.info(
-                    "[scanner][DATA] %3d/%d %-6s | price=%s | PE=%s | EPS=%s | rev=%s | beta=%s | mcap=%s | news=%d",
-                    i,
-                    len(selected),
-                    sym,
-                    _fmt_num(stock.get("latestClose")),
-                    _fmt_num(stock.get("PE")),
-                    _fmt_num(stock.get("trailingEps")),
-                    _fmt_num(stock.get("revenueGrowth")),
-                    _fmt_num(stock.get("beta")),
-                    _fmt_num(stock.get("marketCap"), 0),
-                    len(stock.get("News", [])),
-                )
-
-                if stock.get("News"):
-                    top_titles = [
-                        ((n.get("content") or {}).get("title") or "-")
-                        for n in stock["News"][:3]
-                    ]
-                    log.info("[scanner][NEWS] %-6s | %s", sym, " || ".join(top_titles))
-                else:
-                    log.warning("[scanner][NEWS] %-6s | inga nyheter", sym)
-
-                if stock.get("revenueGrowth") is None:
-                    log.warning("[scanner][REV]  %-6s | revenueGrowth saknas", sym)
-
-                if stock.get("PE") is None:
-                    log.warning("[scanner][PE]   %-6s | PE saknas", sym)
-
-                if stock.get("trailingEps") is None:
-                    log.warning("[scanner][EPS]  %-6s | EPS saknas", sym)
+            stock["News"] = []
 
             ok, reason = _is_good_snapshot(stock)
             if not ok:
@@ -349,7 +297,7 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
             rows.append(stock)
 
             log.info(
-                "[scanner] KEEP  %3d/%d %-6s | pris=%7s | PE=%7s | EPS=%7s | rev=%7s | news=%d",
+                "[scanner] KEEP  %3d/%d %-6s | pris=%7s | PE=%7s | EPS=%7s | rev=%7s",
                 i,
                 len(selected),
                 sym,
@@ -357,7 +305,6 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
                 _fmt_num(stock.get("PE")),
                 _fmt_num(stock.get("trailingEps")),
                 _fmt_num(stock.get("revenueGrowth")),
-                len(stock.get("News", [])),
             )
 
             if len(rows) >= target_rows:

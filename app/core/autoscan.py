@@ -613,6 +613,73 @@ def _owned_label_from_decision(decision: str) -> str:
         return "EXIT WATCH"
     return "HOLD"
 
+def _short_reason_line(row: dict) -> str:
+    sym = row.get("symbol", "?")
+    action = str(row.get("action") or "").lower()
+    score = row.get("total_score")
+    entry_score = row.get("entry_score")
+    quality = row.get("candidate_quality")
+    reasons = row.get("entry_reasons") or []
+
+    above_sma = "price_above_sma20" in reasons
+    below_sma = "price_below_sma20" in reasons
+    trend_up = "sma20_above_or_equal_sma50" in reasons
+    good_rsi = any(r in reasons for r in {"healthy_rsi", "acceptable_rsi"})
+    high_rsi = "slightly_extended_rsi" in reasons
+    good_volume = "ok_volume_confirmation" in reasons
+    strong_momentum = any(r in reasons for r in {"strong_short_momentum", "strong_medium_momentum"})
+    controlled_vol = "controlled_volatility" in reasons
+
+    tags = []
+
+    if action == "buy_ready":
+        if above_sma:
+            tags.append("över SMA20")
+        if trend_up:
+            tags.append("trend upp")
+        if good_rsi:
+            tags.append("bra RSI")
+        elif high_rsi:
+            tags.append("lite hög RSI")
+        if good_volume:
+            tags.append("bra volym")
+        if strong_momentum:
+            tags.append("starkt momentum")
+        if controlled_vol:
+            tags.append("kontrollerad vol")
+
+        return f"{sym}: köp-läge | score {score} | entry {entry_score} | q {quality} | " + ", ".join(tags[:4])
+
+    if action == "watch":
+        if below_sma:
+            tags.append("under SMA20")
+        elif above_sma:
+            tags.append("över SMA20")
+        if trend_up:
+            tags.append("trend upp")
+        if good_rsi:
+            tags.append("ok RSI")
+        elif high_rsi:
+            tags.append("hög RSI")
+        if good_volume:
+            tags.append("bra volym")
+        if strong_momentum:
+            tags.append("momentum finns")
+
+        return f"{sym}: watch-läge | score {score} | entry {entry_score} | q {quality} | " + ", ".join(tags[:4])
+
+    if action in {"exit_ready", "sell_candidate", "exit_watch"}:
+        if below_sma:
+            tags.append("under SMA20")
+        if not trend_up:
+            tags.append("trend svag")
+        if high_rsi:
+            tags.append("utsträckt")
+
+        return f"{sym}: exit-läge | score {score} | entry {entry_score} | q {quality} | " + ", ".join(tags[:4])
+
+    return f"{sym}: {action} | score {score} | entry {entry_score} | q {quality}"
+
 
 async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     autoscan_enabled = AUTOSCAN
@@ -708,7 +775,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     state.setdefault("buys_today", {})
     state.setdefault("sells_today", {})
     state.setdefault("hold_streak", {})
-    state.setdefault("watchlist", {})
     state.setdefault("watchlist", [])
 
     today = _now_utc().date().isoformat()
@@ -812,36 +878,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     owned_sell_soon = 0
     owned_checked = 0
 
-    if portfolio_reviews:
-        _log_section(f"PORTFOLIO REVIEW [{len(portfolio_reviews)}]")
-        for row in portfolio_reviews:
-            sym = row.get("symbol")
-            current_pos = float(row.get("held_position") or 0.0)
-            action = str(row.get("action") or "").strip().lower()
-            quality = row.get("candidate_quality")
-            timing = row.get("timing_state")
-
-            label = _display_label_from_action(action, current_pos)
-
-            log.info(
-                "%s pos=%s | %s | q=%s | timing=%s",
-                sym,
-                current_pos,
-                label,
-                quality,
-                timing,
-            )
-
-            if action == "exit_ready":
-                owned_sell_now += 1
-            elif action == "sell_candidate":
-                owned_sell_soon += 1
-            elif action == "exit_watch":
-                owned_sell_watch += 1
-            elif action == "review_needed":
-                owned_checked += 1
-
-    _log_section("OWNED POSITION ENGINE")
 
     for row in portfolio_reviews:
         sym = row.get("symbol")
@@ -898,15 +934,38 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         set_exit_state(state, sym, exit_state)
 
-        _log_signal_line(
-            label=_owned_label_from_decision("full_exit" if exit_mode == "full" else "soft_exit" if exit_mode == "soft" else "watch_exit" if exit_mode == "watch" else "hold"),
-            sym=sym,
-            qty=min(auto_qty, max(0, int(abs(current_pos)))),
-            price=(analysis.get("raw_technicals") or {}).get("price"),
-            score=analysis.get("total_score"),
+        display_qty = int(abs(current_pos)) if current_pos > 0 else auto_qty
+
+        owned_label = _owned_label_from_decision(
+            "full_exit" if exit_mode == "full"
+            else "soft_exit" if exit_mode == "soft"
+            else "watch_exit" if exit_mode == "watch"
+            else "hold"
         )
 
-        if current_pos > 0:
+        if current_pos < 0 and effective_signal == "Köp":
+            owned_label = "EXIT"
+        elif action == "buy_ready" and current_pos > 0 and exit_mode == "hold":
+            owned_label = "ADD"
+        elif action == "review_needed" and exit_mode == "hold":
+            owned_label = "CHECK"
+
+        show_owned_row = owned_label in {"EXIT", "EXIT SOON", "EXIT WATCH", "ADD", "CHECK"}
+
+        if show_owned_row:
+            _log_signal_line(
+                label=owned_label,
+                sym=sym,
+                qty=display_qty,
+                price=(analysis.get("raw_technicals") or {}).get("price"),
+                score=analysis.get("total_score"),
+            )
+
+        if current_pos > 0 and (
+            pressure != "healthy"
+            or exit_mode in {"full", "soft", "watch"}
+            or action in {"exit_ready", "sell_candidate", "exit_watch", "review_needed"}
+        ):
             log.info(
                 "[OWNED-STATE] %s | pressure=%s | stage=%s | bearish_count=%s | soft_exit_done=%s | reason=%s",
                 sym,
@@ -1141,7 +1200,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         s for s in good_candidates
         if _is_affordable(by_sym.get(s) or {}, auto_qty, max_order_value)
     ]
-
+################################################################################################################
     candidate_source = tradable_candidates if tradable_candidates else good_candidates[:]
 
     if len(candidate_source) < universe_rows:
@@ -1159,15 +1218,24 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     candidate_source = _dedupe_keep_order(candidate_source)
 
+    # Aktivt scan_set ska byggas av de bästa, men replacement_pool måste vara större
+    scan_seed = candidate_source[:]
+
+    # För replacement: börja med resten av tradable/good, inte bara scan_set
+    replacement_source = _dedupe_keep_order(
+        [s for s in tradable_candidates if s not in scan_seed[:universe_rows]]
+        + [s for s in good_candidates if s not in scan_seed[:universe_rows]]
+        + [s for s in all_candidates if s not in scan_seed[:universe_rows]]
+    )
+
     log.info(
-        "[autoscan] FILTERED candidates | all=%d | good=%d | tradable=%d | selected=%d",
+        "[autoscan] FILTERED candidates | all=%d | good=%d | tradable=%d | selected=%d | replacement_candidates=%d",
         len(all_candidates),
         len(good_candidates),
         len(tradable_candidates),
         len(candidate_source),
+        len(replacement_source),
     )
-
-    replacement_source = candidate_source if candidate_source else all_candidates
 
     prev_uni = [s.upper() for s in state.get("universe", []) if s]
     scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, candidate_source, state)
@@ -1240,35 +1308,31 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         log.info("[PRE-ADD] %s", ", ".join(added_pre))
 
     log.info(
-        "POOL universe=%d | all_candidates=%d | scan_set=%d | replacement_pool=%d",
+        "POOL pipeline_final=%d | all_candidates=%d | good=%d | tradable=%d | scan_set=%d | replacement_pool=%d",
         len(by_sym),
         len(all_candidates),
+        len(good_candidates),
+        len(tradable_candidates),
         len(scan_set),
         replacement_pool_size,
     )
-
-    _log_section(f"SCAN_SET [{len(scan_set)}] | replacement_pool={replacement_pool_size}")
     rows_for_log = []
     for sym in scan_set:
         raw = by_sym.get(sym) or {}
-        rows_for_log.append(f"{sym}({_fmt_price(raw.get('latestClose'))})")
-    log.info("%s", ", ".join(rows_for_log))
+        tech_price = ((raw.get("_pipeline_technicals") or {}).get("price"))
+        shown_price = tech_price if tech_price is not None else raw.get("latestClose")
+        rows_for_log.append(f"{sym}({_fmt_price(shown_price)})")
 
     log.info(
-        "MODE=%s | MARKET_OPEN=%s | RISK_OK=%s (%s) | AUTOTRADE=%s",
+        "%s scan=%d | replacements=%d | mode=%s | market=%s | autotrade=%s",
+        _c("RUN:", _CYAN, bold=True),
+        len(scan_set),
+        replacement_pool_size,
         "SIM" if sim_mode else "LIVE",
-        "JA" if market_ok else "NEJ",
-        "JA" if risk_ok else "NEJ",
-        risk_reason or "-",
+        "OPEN" if market_ok else "CLOSED",
         "ON" if autotrade_enabled else "OFF",
     )
-
-    if sim_mode:
-        log.info("%s", _c("LÄGE: SIM MODE → statisk/simulerad utvärdering utan riktiga order", _GRAY))
-    elif not market_ok:
-        log.info("%s", _c("LÄGE: MARKET CLOSED → visar vad boten skulle göra", _GRAY))
-    elif not autotrade_enabled:
-        log.info("%s", _c("LÄGE: AUTOTRADE OFF → visar signaler utan order", _GRAY))
+    log.info("%s %s", _c("SCAN SET:", _CYAN, bold=True), ", ".join(rows_for_log))
 
     initial_scan = list(scan_set)
 
@@ -1296,23 +1360,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 effective_signal = "Köp"
             elif action == "exit_ready":
                 effective_signal = "Sälj"
-
-            log.info(
-                "[ENTRY] %s → action=%s | quality=%s | entry_score=%s | reasons=%s",
-                sym,
-                action,
-                candidate_quality,
-                analysis.get("entry_score"),
-                ",".join(analysis.get("entry_reasons", [])),
-            )
-
-            _log_signal_line(
-                label=_display_label_from_action(action, current_pos),
-                sym=sym,
-                qty=min(auto_qty, int(abs(current_pos))),
-                price=(analysis.get("raw_technicals") or {}).get("price"),
-                score=analysis.get("total_score"),
-            )
 
             _update_watchlist(state, sym, action, candidate_quality)
 
@@ -1507,14 +1554,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             continue
 
         if only_trade_on_signal_change and prev_sig == effective_signal:
-            if debug_autotrade:
-                _log_signal_line(
-                    label=_display_label_from_action(action, current_pos),
-                    sym=sym,
-                    qty=auto_qty,
-                    price=raw_technicals.get("price"),
-                    score=analysis.get("total_score"),
-                )
             update_signal_state(state, sym, effective_signal)
             continue
 
@@ -1797,19 +1836,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     scan_grouped = _group_symbols(scan_results, held_only=False)
     portfolio_grouped = _group_symbols(portfolio_reviews, held_only=True)
 
-    _log_section("SCAN / PORTFOLIO OVERVIEW")
-    log.info("[SCAN WATCH ] %s", _fmt_sym_list(scan_grouped["watch"]))
-    log.info("[SCAN HOLD  ] %s", _fmt_sym_list(scan_grouped["hold"]))
-    log.info("[SCAN BUY   ] %s", _fmt_sym_list(scan_grouped["buy_ready"]))
-    log.info("[SCAN REVIEW] %s", _fmt_sym_list(scan_grouped["review"]))
-
-    log.info("[OWNED STRONG    ] %s", _fmt_sym_list(portfolio_grouped["buy_ready"]))
-    log.info("[OWNED EXIT NOW  ] %s", _fmt_sym_list(portfolio_grouped["exit_ready"]))
-    log.info("[OWNED EXIT SOON ] %s", _fmt_sym_list(portfolio_grouped["sell_candidate"]))
-    log.info("[OWNED EXIT WATCH] %s", _fmt_sym_list(portfolio_grouped["exit_watch"]))
-    log.info("[OWNED WAIT      ] %s", _fmt_sym_list(portfolio_grouped["watch"]))
-    log.info("[OWNED HOLD      ] %s", _fmt_sym_list(portfolio_grouped["hold"]))
-    log.info("[OWNED CHECK     ] %s", _fmt_sym_list(portfolio_grouped["review"]))
+    _log_section("OWNED SUMMARY")
+    log.info("%s %s", _c("STRONG     :", _GREEN, bold=True), _fmt_sym_list(portfolio_grouped["buy_ready"]))
+    log.info("%s %s", _c("EXIT NOW   :", _RED, bold=True), _fmt_sym_list(portfolio_grouped["exit_ready"]))
+    log.info("%s %s", _c("EXIT SOON  :", _YELLOW, bold=True), _fmt_sym_list(portfolio_grouped["sell_candidate"]))
+    log.info("%s %s", _c("EXIT WATCH :", _CYAN, bold=True), _fmt_sym_list(portfolio_grouped["exit_watch"]))
+    log.info("%s %s", _c("WAIT       :", _BLUE, bold=True), _fmt_sym_list(portfolio_grouped["watch"]))
+    log.info("%s %s", _c("HOLD       :", _YELLOW, bold=True), _fmt_sym_list(portfolio_grouped["hold"]))
+    log.info("%s %s", _c("CHECK      :", _RED, bold=True), _fmt_sym_list(portfolio_grouped["review"]))
 
     _log_section("SCAN SUMMARY")
     log.info(
@@ -1829,6 +1863,25 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     log.info("%s %s", _c("SCAN WATCH      :", _CYAN, bold=True), _fmt_sym_list(scan_watch_syms))
     log.info("%s %s", _c("SCAN HOLD       :", _YELLOW, bold=True), _fmt_sym_list(scan_hold_syms))
 
+    top_buys = [r for r in scan_results if str(r.get("action") or "").lower() == "buy_ready"][:4]
+    top_watch = [r for r in scan_results if str(r.get("action") or "").lower() == "watch"][:3]
+    top_exit = [r for r in scan_results if str(r.get("action") or "").lower() in {"exit_ready", "sell_candidate", "exit_watch"}][:3]
+
+    if top_buys:
+        log.info("%s", _c("WHY BUY:", _GREEN, bold=True))
+        for row in top_buys:
+            log.info("  %s", _short_reason_line(row))
+
+    if top_watch:
+        log.info("%s", _c("WHY WATCH:", _CYAN, bold=True))
+        for row in top_watch:
+            log.info("  %s", _short_reason_line(row))
+
+    if top_exit:
+        log.info("%s", _c("WHY EXIT:", _RED, bold=True))
+        for row in top_exit:
+            log.info("  %s", _short_reason_line(row))
+
     log.info(
         "%s universe=%d | candidates=%d | replacements=%d",
         _c("POOL:", _CYAN, bold=True),
@@ -1841,6 +1894,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         log.info(
             "%s + %s | - %s",
             _c("BYTEN:", _CYAN, bold=True),
-            _c(((", ".join(added)) if added else "–"), _GREEN),
-            _c(((", ".join(removed)) if removed else "–"), _RED),
+            _c(", ".join(added) if added else "–", _GREEN),
+            _c(", ".join(removed) if removed else "–", _RED),
         )

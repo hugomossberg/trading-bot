@@ -1,6 +1,7 @@
 #pipeline.py
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from app.config import (
 from app.core.scanner import ensure_stock_info
 from app.core.technicals import build_technical_snapshot
 from app.core.filters import precheck_stock
+
+from app.data.market_data import MarketDataService
 
 from app.core.candidate_profile import build_candidate_profile
 from app.core.entry_engine import evaluate_entry
@@ -31,7 +34,7 @@ from app.core.scoring import (
 )
 
 log = logging.getLogger("pipeline")
-
+md = MarketDataService()
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -146,9 +149,41 @@ def _run_stage2(stage1_passed: list[dict]) -> list[dict]:
 def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
     results = []
 
-    for item in stage2_passed:
+    news_fetch_limit = 10
+    try:
+        news_fetch_limit = int(os.getenv("PIPELINE_NEWS_FETCH_LIMIT", "10"))
+    except Exception:
+        news_fetch_limit = 10
+
+    news_items_limit = 3
+    try:
+        news_items_limit = int(os.getenv("PIPELINE_NEWS_ITEMS", "3"))
+    except Exception:
+        news_items_limit = 3
+
+    for idx, item in enumerate(stage2_passed, start=1):
         stock = dict(item.get("stock") or {})
         symbol = item.get("symbol")
+
+        if idx <= news_fetch_limit:
+            try:
+                news_items = md.get_stock_news(symbol, limit=news_items_limit) or []
+                stock["News"] = [
+                    {
+                        "content": {
+                            "title": n.get("title", ""),
+                            "summary": n.get("text", "") or "",
+                            "publisher": n.get("publisher") or n.get("site", ""),
+                            "link": n.get("url", ""),
+                        }
+                    }
+                    for n in news_items
+                ]
+            except Exception as e:
+                log.warning("[pipeline] NEWS %-6s | fetch fail: %s", symbol, e)
+                stock["News"] = []
+        else:
+            stock["News"] = []
 
         news_score, raw_sentiment = score_news(stock)
         score_details = {
@@ -156,7 +191,26 @@ def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
             "raw_sentiment": raw_sentiment,
         }
 
-        passed = True  # i början låter vi news justera, inte blockera hårt
+        if stock.get("News"):
+            top_titles = [
+                ((n.get("content") or {}).get("title") or "-")
+                for n in stock["News"][:2]
+            ]
+            log.info(
+                "[pipeline][NEWS] %-6s | items=%d | score=%+d | %s",
+                symbol,
+                len(stock.get("News", [])),
+                news_score,
+                " || ".join(top_titles),
+            )
+        else:
+            log.info(
+                "[pipeline][NEWS] %-6s | items=0 | score=%+d",
+                symbol,
+                news_score,
+            )
+
+        passed = True
 
         results.append({
             "symbol": symbol,
@@ -183,7 +237,6 @@ def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
         reverse=True
     )
     return results
-
 
 def _action_priority(action: str) -> int:
     order = {
@@ -295,7 +348,8 @@ async def run_pipeline(ib_client) -> dict:
     stage2 = _run_stage2(stage1_passed[:80])
     stage2_passed = [x for x in stage2 if x.get("passed")]
 
-    stage3 = _run_stage3(stage2_passed[:60])
+    stage3_input = stage2_passed[:20]
+    stage3 = _run_stage3(stage3_input)
     stage3_passed = [x for x in stage3 if x.get("passed")]
 
     final_candidates = _build_final_candidates(
