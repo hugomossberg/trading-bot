@@ -1,3 +1,4 @@
+#ibkr_client.py
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, ScannerSubscription
 import asyncio
 import os
@@ -25,6 +26,15 @@ def _c(text, color):
 def _side_color(side: str):
     return _GREEN if str(side).upper() == "BUY" else _RED
 
+def _to_num(value):
+    try:
+        value = float(value)
+        if value <= 0:
+            return None
+        return value
+    except Exception:
+        return None
+
 
 def _fmt_price(value):
     try:
@@ -38,6 +48,8 @@ def _fmt_qty(value):
         return str(int(value))
     except Exception:
         return str(value)
+
+
 
 
 class IbClient:
@@ -87,6 +99,66 @@ class IbClient:
 
         return None
 
+    
+    async def get_live_quote(self, symbol: str, wait_sec: float = 1.2):
+        contract = Stock(symbol, "SMART", "USD")
+
+        try:
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if not qualified:
+                return None
+            contract = qualified[0]
+        except Exception:
+            return None
+
+        ticker = None
+        try:
+            # 1 = live om tillgängligt
+            try:
+                self.ib.reqMarketDataType(1)
+            except Exception:
+                pass
+
+            ticker = self.ib.reqMktData(contract, "", False, False)
+            await asyncio.sleep(wait_sec)
+
+            bid = _to_num(ticker.bid)
+            ask = _to_num(ticker.ask)
+            last = _to_num(ticker.last)
+            market = _to_num(ticker.marketPrice())
+            close = _to_num(ticker.close)
+
+            mid = None
+            spread = None
+            spread_pct = None
+
+            if bid is not None and ask is not None and ask >= bid:
+                mid = round((bid + ask) / 2, 4)
+                spread = round(ask - bid, 4)
+                if mid and mid > 0:
+                    spread_pct = round((spread / mid) * 100.0, 4)
+
+            return {
+                "symbol": symbol,
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "market": market,
+                "close": close,
+                "mid": mid,
+                "spread": spread,
+                "spread_pct": spread_pct,
+            }
+
+        except Exception:
+            return None
+        finally:
+            try:
+                if ticker is not None:
+                    self.ib.cancelMktData(contract)
+            except Exception:
+                pass
+
     async def place_order(self, symbol, side, qty, bot=None, chat_id=None):
         contract = Stock(symbol, "SMART", "USD")
         side_up = side.upper()
@@ -102,7 +174,26 @@ class IbClient:
             print(f"{_c('● ORDER ERROR', _RED)} qualifyContracts failed for {_c(symbol, _BOLD)}: {e}")
             return None
 
-        ref_price = await self._get_reference_price(contract)
+        quote = await self.get_live_quote(symbol)
+        ref_price = None
+
+        if quote:
+            if side_up == "BUY":
+                ref_price = (
+                    quote.get("ask")
+                    or quote.get("last")
+                    or quote.get("mid")
+                    or quote.get("market")
+                    or quote.get("close")
+                )
+            else:
+                ref_price = (
+                    quote.get("bid")
+                    or quote.get("last")
+                    or quote.get("mid")
+                    or quote.get("market")
+                    or quote.get("close")
+                )
 
         use_limit_orders = os.getenv("USE_LIMIT_ORDERS", "1").strip().lower() in {
             "1", "true", "yes", "on"
@@ -144,8 +235,25 @@ class IbClient:
                 f"type={_c('MARKET', _MAGENTA)}"
             )
             print(_c("═" * 72, side_col))
+        allow_ext_hours = os.getenv("ALLOW_EXTENDED_HOURS", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+
+        order_tif = os.getenv("ORDER_TIF", "DAY").strip().upper() or "DAY"
+
+        try:
+            order.outsideRth = allow_ext_hours
+        except Exception:
+            pass
+
+        try:
+            order.tif = order_tif
+        except Exception:
+            pass
 
         trade = self.ib.placeOrder(contract, order)
+
+        
 
         def on_status(trade_):
             status = trade_.orderStatus.status

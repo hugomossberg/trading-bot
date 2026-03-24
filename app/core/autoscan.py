@@ -53,7 +53,8 @@ from app.core.autoscan_state import (
     state_counter,
     store_owned_snapshot,
 )
-from app.core.helpers import is_dup, kill_switch_ok, market_open_now
+from app.core.helpers import is_dup, kill_switch_ok, market_open_now, market_status_text_sv
+
 from app.core.logview import (
     _BLUE,
     _CYAN,
@@ -67,6 +68,7 @@ from app.core.logview import (
     log_signal_line,
     short_reason_line,
 )
+from app.core.pretrade import validate_pretrade_buy
 from app.core.pipeline import run_pipeline
 from app.core.signals import execute_order
 from app.core.storage_utils import (
@@ -334,12 +336,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     debug_log(log, "[autoscan] FINAL symbols=%s", sorted(list(by_sym.keys())))
 
     risk_ok, risk_reason = kill_switch_ok(
-        getattr(ib_client, "pnl_realized_today", 0.0),
-        getattr(ib_client, "pnl_unrealized_open", 0.0),
+    getattr(ib_client, "pnl_realized_today", 0.0),
+    getattr(ib_client, "pnl_unrealized_open", 0.0),
     )
     market_ok = market_open_now()
     sim_mode = sim_market
 
+    log.info("[market] %s", market_status_text_sv())
     debug_log(log, "[autoscan] market_ok=%s risk_ok=%s risk_reason=%s", market_ok, risk_ok, risk_reason)
 
     added = []
@@ -1191,8 +1194,46 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                     continue
 
-            price_now = to_float(raw_technicals.get("price"), 0) or to_float(raw.get("latestClose"), 0)
+            pretrade = None
 
+            if action_signal == "Köp":
+                pretrade = await validate_pretrade_buy(
+                    symbol=sym,
+                    raw=raw,
+                    analysis=analysis,
+                    ib_client=ib_client,
+                    qty=qty,
+                    max_order_value=max_order_value,
+                )
+
+                if not pretrade.get("ok"):
+                    log.info(
+                        "[SKIP] %s → pretrade blocked | %s",
+                        sym,
+                        pretrade.get("reason"),
+                    )
+
+                    append_event(
+                        "buy_blocked_pretrade",
+                        symbol=sym,
+                        name=raw.get("name") or raw.get("companyName") or sym,
+                        data={
+                            "reason": pretrade.get("reason"),
+                            "quote": pretrade.get("quote"),
+                            "score": analysis.get("total_score"),
+                            "entry_score": analysis.get("entry_score"),
+                            "action": action,
+                        },
+                    )
+
+                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                    continue
+
+            price_now = (
+                (pretrade or {}).get("live_price")
+                or to_float(raw_technicals.get("price"), 0)
+                or to_float(raw.get("latestClose"), 0)
+            )
             if action_signal == "Köp" and price_now > 0:
                 est_value = price_now * qty
                 if est_value > max_order_value:
