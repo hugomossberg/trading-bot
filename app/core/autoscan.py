@@ -1,23 +1,57 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from app.config import (
     AUTO_QTY,
     AUTOSCAN,
     AUTOTRADE,
     CANDIDATE_MULTIPLIER,
-    DEBUG_AUTOTRADE,
-    DROP_IF_HOLD_STREAK,
     FINAL_CANDIDATES_PATH,
     LOG_UNIVERSE,
     SIGNAL_LOG_PATH,
     SUMMARY_NOTIFS,
     UNIVERSE_ROWS,
 )
-
+from app.core.autoscan_owned import (
+    advance_long_exit_state,
+    build_owned_decision_state,
+    build_owned_review_row,
+    classify_exit_pressure,
+    decide_long_exit,
+    resolve_owned_input,
+)
+from app.core.autoscan_scan import (
+    available_replacements,
+    build_analysis_cache,
+    candidate_bucket,
+    candidate_sort_key_factory,
+    is_affordable,
+    replacement_is_meaningfully_better,
+    should_rotate_candidate,
+)
+from app.core.autoscan_shared import (
+    build_decision_snapshot,
+    build_pipeline_analysis,
+    dedupe_keep_order,
+    fmt_price,
+    fmt_score_plain,
+    is_material_change,
+    normalize_stock,
+    now_utc,
+    to_float,
+)
+from app.core.autoscan_state import (
+    ensure_state_defaults,
+    increment_day_counter,
+    is_excluded,
+    is_in_cooldown,
+    mark_trade_timestamp,
+    set_exclude_minutes,
+    state_counter,
+    store_owned_snapshot,
+)
+from app.core.helpers import is_dup, kill_switch_ok, market_open_now
 from app.core.logview import (
     _BLUE,
     _CYAN,
@@ -31,8 +65,6 @@ from app.core.logview import (
     log_signal_line,
     short_reason_line,
 )
-
-from app.core.helpers import is_dup, kill_switch_ok, market_open_now
 from app.core.pipeline import run_pipeline
 from app.core.signals import execute_order
 from app.core.storage_utils import (
@@ -42,32 +74,19 @@ from app.core.storage_utils import (
     save_portfolio_review,
 )
 from app.core.universe_manager import (
+    get_decision_state,
     get_exit_state,
     load_state,
     reset_symbol_rotation_state,
     rotate_universe,
     save_state,
+    set_decision_state,
     set_exit_state,
     update_signal_state,
 )
 
 log = logging.getLogger("autoscan")
 
-
-
-def _fmt_price(value) -> str:
-    v = _to_float(value, None)
-    if v is None:
-        return "-"
-    return f"{v:.2f}"
-
-
-def _fmt_score_plain(value) -> str:
-    try:
-        v = int(value)
-    except Exception:
-        return "-"
-    return f"{v:+d}"
 
 def _env_bool(key: str, default: bool) -> bool:
     value = os.getenv(key, "").strip().lower()
@@ -86,85 +105,9 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-def _to_float(x, default=None):
-    try:
-        if isinstance(x, str):
-            x = x.strip().replace(",", ".")
-        return float(x)
-    except Exception:
-        return default
-
-
-def _to_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def _candidate_bucket(stock: dict) -> str | None:
-    analysis = _build_pipeline_analysis(stock or {})
-    action = str(analysis.get("action") or "").strip().lower()
-    quality = str(analysis.get("candidate_quality") or "").upper()
-    retention_score = int(analysis.get("retention_score", analysis.get("total_score", 0)) or 0)
-    entry_score = int(analysis.get("entry_score", 0) or 0)
-    total_score = int(analysis.get("total_score", 0) or 0)
-
-    if (
-        action == "buy_ready"
-        and quality in {"A+", "A", "B"}
-        and entry_score >= 5
-        and total_score >= 3
-    ):
-        return "entry"
-
-    if (
-        action in {"watch", "hold_candidate"}
-        and quality in {"A+", "A", "B"}
-        and retention_score >= 2
-        and entry_score >= 0
-    ):
-        return "watch"
-
-    if (
-        action in {"watch", "hold_candidate"}
-        and quality in {"A+", "A", "B", "C"}
-        and retention_score >= 0
-    ):
-        return "fallback"
-
-    if (
-        action == "sell_candidate"
-        and quality in {"A+", "A", "B"}
-        and retention_score >= 6
-    ):
-        return "fallback"
-
-    return None
-
-
-
-
-def _is_affordable(stock: dict, qty: int, max_order_value: float) -> bool:
-    price = _to_float((stock or {}).get("latestClose"), None)
-    if price is None or price <= 0:
-        return False
-    return (price * qty) <= max_order_value
-
-
-
-
-def _normalize_stock(stock: dict) -> dict:
-    normalized = dict(stock or {})
-    for key in ("latestClose", "PE", "marketCap", "beta", "trailingEps", "dividendYield"):
-        normalized[key] = _to_float(normalized.get(key), 0.0)
-    return normalized
-
-
-def _now_utc():
-    return datetime.now(timezone.utc)
-
-
 def trim_jsonl(path: str, keep_last: int = 5000):
+    from pathlib import Path
+
     p = Path(path)
     if not p.exists():
         return
@@ -173,220 +116,6 @@ def trim_jsonl(path: str, keep_last: int = 5000):
     if len(lines) > keep_last:
         with p.open("w", encoding="utf-8") as f:
             f.writelines(lines[-keep_last:])
-
-
-def _dedupe_keep_order(items):
-    seen = set()
-    out = []
-    for item in items or []:
-        if not item:
-            continue
-        item = str(item).upper().strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
-
-
-def _quality_rank(value: str) -> int:
-    mapping = {
-        "A+": 5,
-        "A": 4,
-        "B": 3,
-        "C": 2,
-        "D": 1,
-    }
-    return mapping.get(str(value or "").upper(), 0)
-
-
-def _is_buy_action(action: str) -> bool:
-    return str(action or "").strip().lower() == "buy_ready"
-
-
-def _is_watch_action(action: str) -> bool:
-    return str(action or "").strip().lower() in {"watch", "hold_position", "hold_candidate"}
-
-
-def _is_exit_action(action: str) -> bool:
-    return str(action or "").strip().lower() == "exit_ready"
-
-
-def _is_allowed_replacement_action(action: str, held_pos: float = 0.0) -> bool:
-    action = str(action or "").strip().lower()
-
-    if action in {"buy_ready", "watch", "hold_candidate", "hold_position"}:
-        return True
-
-    if action in {"review_needed", "exit_watch"} and held_pos <= 0:
-        return True
-
-    if action == "sell_candidate" and held_pos <= 0:
-        return True  # tillåt som svag replacement i paper
-
-    if action == "exit_ready":
-        return held_pos > 0
-
-    if action == "avoid":
-        return False
-
-    return False
-
-
-def _update_watchlist(state: dict, sym: str, action: str, quality: str):
-    watchlist = _dedupe_keep_order(state.get("watchlist", []))
-
-    action = str(action or "").strip().lower()
-    quality_rank = _quality_rank(quality)
-
-    should_watch = action == "watch" and quality_rank >= 3
-
-    if should_watch and sym not in watchlist:
-        watchlist.append(sym)
-
-    if not should_watch and sym in watchlist:
-        watchlist.remove(sym)
-
-    state["watchlist"] = _dedupe_keep_order(watchlist)
-
-def _should_rotate_candidate(action: str, retention_score: int, quality: str, held_pos: float) -> tuple[bool, str | None]:
-    action = str(action or "").strip().lower()
-    quality_value = _quality_rank(quality)
-
-    if action == "avoid":
-        return True, "replace due to action=avoid"
-
-    if action in {"exit_ready", "sell_candidate"} and held_pos <= 0:
-        return True, f"replace due to {action} without position"
-
-    if retention_score <= 4 and quality_value <= 2 and held_pos <= 0:
-        return True, f"replace due to retention_score={retention_score} quality={quality}"
-
-    if retention_score <= 2 and held_pos <= 0:
-        return True, f"replace due to low retention_score={retention_score}"
-
-    return False, None
-
-
-def _required_replacement_delta(
-    watch_streak: int,
-    current_action: str,
-    current_quality: str,
-    current_retention: int,
-) -> int:
-    current_action = str(current_action or "").strip().lower()
-    current_quality_rank = _quality_rank(current_quality)
-
-    if watch_streak >= 30 and current_action in {"watch", "hold_candidate"}:
-        return 0
-    if watch_streak >= 20 and current_action in {"watch", "hold_candidate"}:
-        return 1
-    if watch_streak >= 10 and current_action in {"watch", "hold_candidate"}:
-        return 2
-
-    if current_retention <= 3 or current_quality_rank <= 2:
-        return 1
-
-    return 3
-
-
-def _replacement_is_meaningfully_better(
-    current_analysis: dict,
-    replacement_stock: dict,
-    watch_streak: int = 0,
-) -> bool:
-    current_retention = int(current_analysis.get("retention_score", current_analysis.get("total_score", 0)) or 0)
-    current_quality = current_analysis.get("candidate_quality")
-    current_action = str(current_analysis.get("action") or "").strip().lower()
-
-    repl_analysis = _build_pipeline_analysis(replacement_stock or {})
-    repl_replacement_score = int(repl_analysis.get("replacement_score", repl_analysis.get("total_score", 0)) or 0)
-    repl_quality = repl_analysis.get("candidate_quality")
-    repl_action = str(repl_analysis.get("action") or "").strip().lower()
-
-    if repl_action == "buy_ready" and current_action not in {"buy_ready", "hold_position"}:
-        return True
-
-    required_delta = _required_replacement_delta(
-        watch_streak=watch_streak,
-        current_action=current_action,
-        current_quality=current_quality,
-        current_retention=current_retention,
-    )
-
-    if repl_replacement_score >= current_retention + required_delta:
-        return True
-
-    if _quality_rank(repl_quality) > _quality_rank(current_quality):
-        if repl_replacement_score >= current_retention + max(0, required_delta - 1):
-            return True
-
-    return False
-
-
-def _build_pipeline_analysis(stock: dict) -> dict:
-    sym = (stock.get("symbol") or "").upper().strip()
-
-    pipeline_signal = stock.get("_pipeline_signal") or "Håll"
-    pipeline_score = stock.get("_pipeline_final_score", 0)
-    pipeline_technicals = stock.get("_pipeline_technicals") or {}
-    pipeline_scores = stock.get("_pipeline_scores") or {}
-    pipeline_score_details = stock.get("_pipeline_score_details") or {}
-
-    return {
-        "symbol": sym,
-        "signal": pipeline_signal,
-        "total_score": pipeline_score,
-        "candidate_score": stock.get("_pipeline_candidate_score", pipeline_score),
-        "entry_score": stock.get("_pipeline_entry_score", 0),
-        "candidate_quality": stock.get("_pipeline_candidate_quality", "C"),
-        "setup_type": stock.get("_pipeline_setup_type", "unknown"),
-        "timing_state": stock.get("_pipeline_timing_state", "unknown"),
-        "action": stock.get("_pipeline_action", "watch"),
-        "positive_flags": stock.get("_pipeline_positive_flags") or [],
-        "risk_flags": stock.get("_pipeline_risk_flags") or [],
-        "entry_reasons": stock.get("_pipeline_entry_reasons") or [],
-        "retention_score": stock.get("_pipeline_retention_score", pipeline_score),
-        "replacement_score": stock.get("_pipeline_replacement_score", pipeline_score),
-        "rank": stock.get("_pipeline_rank"),
-        "raw_technicals": pipeline_technicals,
-        "pipeline_scores": pipeline_scores,
-        "pipeline_score_details": pipeline_score_details,
-        "timestamp": _now_utc().isoformat(),
-    }
-
-
-def _build_portfolio_review(held: dict, by_sym: dict) -> list[dict]:
-    reviews = []
-
-    for sym, pos in (held or {}).items():
-        stock = by_sym.get(sym)
-        if not stock:
-            if abs(float(pos or 0.0)) < 1:
-                continue
-            reviews.append({
-                "symbol": sym,
-                "held_position": pos,
-                "status": "missing_from_pipeline",
-                "action": "review_needed",
-            })
-            continue
-
-        analysis = _build_pipeline_analysis(stock)
-        reviews.append({
-            "symbol": sym,
-            "held_position": pos,
-            "signal": analysis.get("signal"),
-            "action": analysis.get("action"),
-            "candidate_quality": analysis.get("candidate_quality"),
-            "entry_score": analysis.get("entry_score"),
-            "retention_score": analysis.get("retention_score"),
-            "replacement_score": analysis.get("replacement_score"),
-            "timing_state": analysis.get("timing_state"),
-            "entry_reasons": analysis.get("entry_reasons") or [],
-        })
-
-    return reviews
 
 
 def _group_symbols(rows: list[dict], held_only: bool = False) -> dict:
@@ -405,8 +134,26 @@ def _group_symbols(rows: list[dict], held_only: bool = False) -> dict:
         sym = row.get("symbol")
         action = str(row.get("action") or "").strip().lower()
         held_pos = float(row.get("held_position") or 0.0)
+        owned_label = str(row.get("owned_label") or "").strip().upper()
 
         if held_only and held_pos == 0:
+            continue
+
+        if held_only:
+            if owned_label == "EXIT":
+                grouped["exit_ready"].append(sym)
+            elif owned_label == "EXIT SOON":
+                grouped["sell_candidate"].append(sym)
+            elif owned_label == "EXIT WATCH":
+                grouped["exit_watch"].append(sym)
+            elif owned_label == "CHECK":
+                grouped["review"].append(sym)
+            elif action == "buy_ready":
+                grouped["buy_ready"].append(sym)
+            elif action == "watch":
+                grouped["watch"].append(sym)
+            else:
+                grouped["hold"].append(sym)
             continue
 
         if action == "buy_ready":
@@ -443,132 +190,53 @@ def _group_symbols(rows: list[dict], held_only: bool = False) -> dict:
     return grouped
 
 
-def _classify_exit_pressure(analysis: dict, current_pos: float) -> str:
-    """
-    long-position:
-      healthy   = normalt / förbättrat
-      weak      = första avvikelse
-      bearish   = bekräftad svaghet
-      emergency = sälj nu
-    """
-    if current_pos <= 0:
-        return "healthy"
-
-    action = str(analysis.get("action") or "").strip().lower()
-    timing_state = str(analysis.get("timing_state") or "").strip().lower()
-    quality_rank = _quality_rank(analysis.get("candidate_quality"))
-    score = _to_int(analysis.get("total_score"), 0)
-    retention = _to_int(analysis.get("retention_score"), score)
-
-    if action == "exit_ready":
-        return "emergency"
-
-    if score <= -4:
-        return "emergency"
-
-    if retention <= 0 and timing_state == "avoid":
-        return "emergency"
-
-    if action == "sell_candidate":
-        return "bearish"
-
-    if action == "exit_watch":
-        return "weak"
-
-    if timing_state == "avoid" and (quality_rank <= 2 or retention <= 3):
-        return "bearish"
-
-    if action in {"watch"} and retention <= 3:
-        return "weak"
-
-    return "healthy"
+def _apply_symbol_state(
+    state: dict,
+    sym: str,
+    curr_decision: dict,
+    effective_signal: str,
+    removed_this_pass: set[str] | None = None,
+):
+    if removed_this_pass and sym in removed_this_pass:
+        return
+    set_decision_state(state, sym, curr_decision)
+    update_signal_state(state, sym, effective_signal)
 
 
-def _advance_long_exit_state(exit_state: dict, analysis: dict, pressure: str) -> dict:
-    stage = _to_int(exit_state.get("stage"), 0)
-    bearish_count = _to_int(exit_state.get("bearish_count"), 0)
-    soft_exit_done = bool(exit_state.get("soft_exit_done", False))
+def _build_by_sym(universe: list[dict]) -> dict:
+    by_sym = {}
 
-    score = _to_int(analysis.get("total_score"), 0)
-    retention = _to_int(analysis.get("retention_score"), score)
-    action = str(analysis.get("action") or "").strip().lower()
-    timing_state = str(analysis.get("timing_state") or "").strip().lower()
+    for s in universe or []:
+        sym = (s.get("symbol") or "").upper().strip()
+        if not sym:
+            continue
 
-    if pressure == "emergency":
-        stage = 4
-        bearish_count += 1
+        stock = dict(s.get("stock") or {})
+        stock["symbol"] = sym
+        stock["name"] = s.get("name") or stock.get("name") or sym
 
-    elif pressure == "bearish":
-        bearish_count += 1
-        stage = max(stage, min(4, bearish_count))
+        stock["_pipeline_signal"] = s.get("signal")
+        stock["_pipeline_final_score"] = s.get("final_score")
+        stock["_pipeline_technicals"] = s.get("technicals") or {}
+        stock["_pipeline_scores"] = s.get("scores") or {}
+        stock["_pipeline_score_details"] = s.get("score_details") or {}
 
-    elif pressure == "weak":
-        bearish_count = max(1, bearish_count)
-        stage = max(stage, 1)
-        if stage > 2:
-            stage = 2
+        stock["_pipeline_candidate_score"] = s.get("candidate_score", s.get("final_score", 0))
+        stock["_pipeline_entry_score"] = s.get("entry_score", 0)
+        stock["_pipeline_candidate_quality"] = s.get("candidate_quality", "C")
+        stock["_pipeline_setup_type"] = s.get("setup_type", "unknown")
+        stock["_pipeline_timing_state"] = s.get("timing_state", "unknown")
+        stock["_pipeline_action"] = s.get("action", "watch")
+        stock["_pipeline_positive_flags"] = s.get("positive_flags") or []
+        stock["_pipeline_risk_flags"] = s.get("risk_flags") or []
+        stock["_pipeline_entry_reasons"] = s.get("entry_reasons") or []
+        stock["_pipeline_retention_score"] = s.get("retention_score", s.get("final_score", 0))
+        stock["_pipeline_replacement_score"] = s.get("replacement_score", s.get("final_score", 0))
+        stock["_pipeline_rank"] = s.get("rank")
 
-    else:  # healthy
-        bearish_count = 0
-        if action in {"buy_ready", "hold_candidate", "hold_position"} and retention >= 4:
-            stage = 0
-        else:
-            stage = max(0, stage - 1)
+        by_sym[sym] = stock
 
-        if stage == 0:
-            soft_exit_done = False
-
-    exit_state["stage"] = stage
-    exit_state["bearish_count"] = bearish_count
-    exit_state["last_action"] = action or "hold"
-    exit_state["last_score"] = score
-    exit_state["last_retention_score"] = retention
-    exit_state["last_timing_state"] = timing_state or "unknown"
-    exit_state["soft_exit_done"] = soft_exit_done
-    exit_state["updated_at"] = _now_utc().isoformat()
-
-    return exit_state
-
-
-def _decide_long_exit(exit_state: dict, pressure: str) -> tuple[str, str]:
-    stage = _to_int(exit_state.get("stage"), 0)
-    bearish_count = _to_int(exit_state.get("bearish_count"), 0)
-    soft_exit_done = bool(exit_state.get("soft_exit_done", False))
-    last_score = _to_int(exit_state.get("last_score"), 0)
-    last_retention = _to_int(exit_state.get("last_retention_score"), 0)
-
-    if pressure == "emergency":
-        return "full_exit", "emergency_exit"
-
-    if last_score <= -5:
-        return "full_exit", "very_low_score_exit"
-
-    if last_retention <= 0:
-        return "full_exit", "retention_broken"
-
-    if stage >= 4 and bearish_count >= 3:
-        return "full_exit", "confirmed_full_exit"
-
-    if stage >= 3 and bearish_count >= 2 and not soft_exit_done:
-        return "soft_exit", "confirmed_soft_exit"
-
-    if stage >= 2:
-        return "watch_exit", "confirmed_bearish_watch"
-
-    if stage >= 1:
-        return "watch_exit", "first_exit_warning"
-
-    return "hold", "healthy"
-
-
-def _owned_label_from_decision(decision: str) -> str:
-    if decision == "full_exit":
-        return "EXIT"
-    if decision == "soft_exit":
-        return "EXIT SOON"
-    if decision == "watch_exit":
-        return "EXIT WATCH"
-    return "HOLD"
+    return by_sym
 
 
 async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
@@ -591,14 +259,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     max_pos_per_symbol = _env_int("MAX_POS_PER_SYMBOL", 0)
     max_buys_per_day = _env_int("MAX_BUYS_PER_DAY", 1)
     max_new_entries_per_pass = _env_int("MAX_NEW_ENTRIES_PER_PASS", 2)
-
-
-    entries_this_pass = 0
-
     max_sells_per_day = _env_int("MAX_SELLS_PER_DAY", 2)
     pass_ex_min = _env_int("PASS_EXCLUDE_MINUTES", _env_int("ASS_EXCLUDE_MINUTES", 20))
     exclude_bought_min = _env_int("EXCLUDE_BOUGHT_MIN", 120)
-    max_order_value = _to_float(os.getenv("MAX_ORDER_VALUE_USD", "30"), 30.0)
+    drop_if_hold_streak = _env_int("DROP_IF_HOLD_STREAK", 6)
+    max_order_value = to_float(os.getenv("MAX_ORDER_VALUE_USD", "30"), 30.0)
+
+    entries_this_pass = 0
 
     log.info(
         "CFG UNIVERSE_ROWS=%s CAND_MULT=%s AUTOTRADE=%s ENTRY_MODE=%s PASS_EX_MIN=%s EXCLUDE_BOUGHT_MIN=%s MAX_ORDER_VALUE=%s",
@@ -639,7 +306,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         for p in positions
         if abs(float(p.position or 0.0)) >= 1
     }
-    
 
     try:
         await ib_client.ib.reqOpenOrdersAsync()
@@ -657,111 +323,23 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     except Exception:
         open_buy_syms = set()
 
-    state = load_state()
-    state.setdefault("last_signal", {})
-    state.setdefault("exclude_until", {})
-    state.setdefault("last_trade_ts", {})
-    state.setdefault("buys_today", {})
-    state.setdefault("sells_today", {})
-    state.setdefault("hold_streak", {})
-    state.setdefault("watchlist", [])
+    state = ensure_state_defaults(load_state())
+    today = now_utc().date().isoformat()
 
-    today = _now_utc().date().isoformat()
-
-    def _in_cooldown(sym: str) -> bool:
-        ts = state["last_trade_ts"].get(sym)
-        if not ts:
-            return False
-        try:
-            last = datetime.fromisoformat(str(ts))
-            return (_now_utc() - last) < timedelta(minutes=cooldown_min)
-        except Exception:
-            return False
-
-    def _counter(bucket: str, sym: str) -> dict:
-        rec = state[bucket].get(sym, {"date": today, "count": 0})
-        if rec.get("date") != today:
-            rec = {"date": today, "count": 0}
-        return rec
-
-    def _is_excluded(sym: str) -> bool:
-        iso = state["exclude_until"].get(sym)
-        if not iso:
-            return False
-        try:
-            until = datetime.fromisoformat(str(iso))
-            return _now_utc() < until
-        except Exception:
-            return False
-
-    # =========================
-    # BUILD by_sym
-    # =========================
-    by_sym = {}
-    for s in universe:
-        sym = (s.get("symbol") or "").upper().strip()
-        if not sym:
-            continue
-
-        stock = dict(s.get("stock") or {})
-        stock["symbol"] = sym
-        stock["name"] = s.get("name") or stock.get("name") or sym
-
-        stock["_pipeline_signal"] = s.get("signal")
-        stock["_pipeline_final_score"] = s.get("final_score")
-        stock["_pipeline_technicals"] = s.get("technicals") or {}
-        stock["_pipeline_scores"] = s.get("scores") or {}
-        stock["_pipeline_score_details"] = s.get("score_details") or {}
-
-        stock["_pipeline_candidate_score"] = s.get("candidate_score", s.get("final_score", 0))
-        stock["_pipeline_entry_score"] = s.get("entry_score", 0)
-        stock["_pipeline_candidate_quality"] = s.get("candidate_quality", "C")
-        stock["_pipeline_setup_type"] = s.get("setup_type", "unknown")
-        stock["_pipeline_timing_state"] = s.get("timing_state", "unknown")
-        stock["_pipeline_action"] = s.get("action", "watch")
-        stock["_pipeline_positive_flags"] = s.get("positive_flags") or []
-        stock["_pipeline_risk_flags"] = s.get("risk_flags") or []
-        stock["_pipeline_entry_reasons"] = s.get("entry_reasons") or []
-        stock["_pipeline_retention_score"] = s.get("retention_score", s.get("final_score", 0))
-        stock["_pipeline_replacement_score"] = s.get("replacement_score", s.get("final_score", 0))
-        stock["_pipeline_rank"] = s.get("rank")
-
-        by_sym[sym] = stock
+    by_sym = _build_by_sym(universe)
+    analysis_cache = build_analysis_cache(by_sym)
+    candidate_sort_key = candidate_sort_key_factory(by_sym)
 
     debug_log(log, "[autoscan] FINAL symbols=%s", sorted(list(by_sym.keys())))
 
-    def _candidate_sort_key(sym: str):
-        stock = by_sym.get(sym) or {}
-        analysis = _build_pipeline_analysis(stock)
-
-        action = str(analysis.get("action") or "").strip().lower()
-        replacement_score = int(analysis.get("replacement_score", analysis.get("total_score", 0)) or 0)
-        retention_score = int(analysis.get("retention_score", analysis.get("total_score", 0)) or 0)
-        entry_score = int(analysis.get("entry_score", 0) or 0)
-        total_score = int(analysis.get("total_score", 0) or 0)
-        quality_rank = _quality_rank(analysis.get("candidate_quality"))
-        price = _to_float(stock.get("latestClose"), 999999)
-
-        return (
-            1 if action == "buy_ready" else 0,
-            replacement_score,
-            retention_score,
-            entry_score,
-            total_score,
-            quality_rank,
-            -price,
-        )
-
-    # =========================
-    # GEMENSAM INIT
-    # =========================
     risk_ok, risk_reason = kill_switch_ok(
         getattr(ib_client, "pnl_realized_today", 0.0),
         getattr(ib_client, "pnl_unrealized_open", 0.0),
     )
     market_ok = market_open_now()
-    debug_log(log, "[autoscan] market_ok=%s", market_ok)
-    sim_mode = os.getenv("SIM_MARKET", "0").strip().lower() in {"1", "true", "yes", "on"}
+    sim_mode = sim_market
+
+    debug_log(log, "[autoscan] market_ok=%s risk_ok=%s risk_reason=%s", market_ok, risk_ok, risk_reason)
 
     added = []
     removed = []
@@ -779,58 +357,41 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     orders_for_report = []
     owned_orders_for_report = []
     scan_results = []
+    portfolio_reviews = []
 
     # =========================
     # PORTFOLIO REVIEW / OWNED ENGINE
     # =========================
-    portfolio_reviews = _build_portfolio_review(held, by_sym)
-
     owned_sell_now = 0
     owned_sell_watch = 0
     owned_sell_soon = 0
     owned_checked = 0
 
-
-    for row in portfolio_reviews:
-        sym = row.get("symbol")
-        current_pos = float(row.get("held_position") or 0.0)
-        action = str(row.get("action") or "").strip().lower()
-
-        if current_pos == 0:
+    for sym, current_pos in held.items():
+        if float(current_pos or 0.0) == 0:
             continue
 
         raw = by_sym.get(sym) or {"symbol": sym, "name": sym}
+        analysis = resolve_owned_input(sym, by_sym, state)
+        missing_from_pipeline = bool(analysis.get("missing_from_pipeline"))
+        action = str(analysis.get("action") or "").strip().lower()
 
-        missing_from_pipeline = sym not in by_sym
-
-        analysis = _build_pipeline_analysis(raw) if not missing_from_pipeline else {
-            "symbol": sym,
-            "signal": "Håll",
-            "action": "review_needed",
-            "total_score": 0,
-            "candidate_quality": None,
-            "timing_state": "missing_from_pipeline",
-            "raw_technicals": {},
-            "retention_score": 999,
-            "replacement_score": 999,
-        }
-
-        pressure = "healthy"
         exit_state = get_exit_state(state, sym)
         effective_signal = "Håll"
         exit_mode = "hold"
         owned_reason = "healthy"
+        pressure = "healthy"
 
         if current_pos > 0:
             if missing_from_pipeline:
                 pressure = "healthy"
                 effective_signal = "Håll"
                 exit_mode = "hold"
-                owned_reason = "missing_from_pipeline_review"
+                owned_reason = "missing_from_pipeline_neutral"
             else:
-                pressure = _classify_exit_pressure(analysis, current_pos)
-                exit_state = _advance_long_exit_state(exit_state, analysis, pressure)
-                decision, owned_reason = _decide_long_exit(exit_state, pressure)
+                pressure = classify_exit_pressure(analysis, current_pos)
+                exit_state = advance_long_exit_state(exit_state, analysis, pressure)
+                decision, owned_reason = decide_long_exit(exit_state, pressure)
 
                 if decision == "full_exit":
                     effective_signal = "Sälj"
@@ -858,23 +419,35 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         if not missing_from_pipeline:
             set_exit_state(state, sym, exit_state)
 
-        display_qty = int(abs(current_pos)) if current_pos > 0 else auto_qty
-
-        owned_label = _owned_label_from_decision(
-            "full_exit" if exit_mode == "full"
-            else "soft_exit" if exit_mode == "soft"
-            else "watch_exit" if exit_mode == "watch"
-            else "hold"
+        prev_decision = get_decision_state(state, sym)
+        curr_decision, state_label, material_change, changed_fields = build_owned_decision_state(
+            prev_decision=prev_decision,
+            effective_signal=effective_signal,
+            analysis=analysis,
+            pressure=pressure,
+            exit_mode=exit_mode,
+            exit_state=exit_state,
         )
 
-        if current_pos < 0 and effective_signal == "Köp":
-            owned_label = "EXIT"
-        elif action == "buy_ready" and current_pos > 0 and exit_mode == "hold":
-            owned_label = "ADD"
-        elif (action == "review_needed" or missing_from_pipeline) and exit_mode == "hold":
-            owned_label = "CHECK"   
+        owned_row = build_owned_review_row(
+            sym=sym,
+            raw=raw,
+            analysis=analysis,
+            current_pos=current_pos,
+            effective_signal=effective_signal,
+            exit_mode=exit_mode,
+            owned_reason=owned_reason,
+            exit_state=exit_state,
+        )
+        owned_row["state_label"] = state_label
+        owned_row["changed_fields"] = changed_fields
+        portfolio_reviews.append(owned_row)
+        store_owned_snapshot(state, owned_row)
 
-        show_owned_row = owned_label in {"EXIT", "EXIT SOON", "EXIT WATCH", "CHECK"}
+        owned_label = owned_row.get("owned_label", "HOLD")
+        display_qty = int(abs(current_pos)) if current_pos > 0 else auto_qty
+
+        show_owned_row = owned_label in {"EXIT", "EXIT SOON", "EXIT WATCH", "CHECK"} or material_change
 
         if owned_label == "EXIT":
             owned_sell_now += 1
@@ -885,9 +458,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         elif owned_label == "CHECK":
             owned_checked += 1
 
-        
-
-
         if show_owned_row:
             log_signal_line(
                 log,
@@ -897,6 +467,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 price=(analysis.get("raw_technicals") or {}).get("price"),
                 score=analysis.get("total_score"),
             )
+
         if current_pos > 0 and (
             pressure != "healthy"
             or exit_mode in {"full", "soft", "watch"}
@@ -904,46 +475,58 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         ):
             debug_log(
                 log,
-                "[OWNED-STATE] %s | pressure=%s | stage=%s | bearish_count=%s | soft_exit_done=%s | reason=%s",
+                "[OWNED-STATE] %s | pressure=%s | stage=%s | bearish_count=%s | soft_exit_done=%s | reason=%s | source=%s",
                 sym,
                 pressure,
                 exit_state.get("stage"),
                 exit_state.get("bearish_count"),
                 exit_state.get("soft_exit_done"),
                 owned_reason,
+                analysis.get("data_source"),
             )
 
-        append_event(
-            "owned_position_review",
-            symbol=sym,
-            name=raw.get("name") or raw.get("companyName") or sym,
-            data={
-                "action": action,
-                "signal": effective_signal,
-                "held_position": current_pos,
-                "timing_state": analysis.get("timing_state"),
-                "quality": analysis.get("candidate_quality"),
-                "score": analysis.get("total_score"),
-                "exit_mode": exit_mode,
-                "exit_stage": exit_state.get("stage"),
-                "exit_reason": owned_reason,
-            },
-        )
+        if material_change:
+            append_event(
+                "owned_position_review",
+                symbol=sym,
+                name=raw.get("name") or raw.get("companyName") or sym,
+                data={
+                    "action": action,
+                    "signal": effective_signal,
+                    "held_position": current_pos,
+                    "timing_state": analysis.get("timing_state"),
+                    "quality": analysis.get("candidate_quality"),
+                    "score": analysis.get("total_score"),
+                    "exit_mode": exit_mode,
+                    "exit_stage": exit_state.get("stage"),
+                    "exit_reason": owned_reason,
+                    "state_label": state_label,
+                    "changed_fields": changed_fields,
+                    "data_source": analysis.get("data_source"),
+                    "missing_from_pipeline": missing_from_pipeline,
+                },
+            )
 
         if effective_signal not in {"Sälj", "Köp"}:
-            update_signal_state(state, sym, effective_signal)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal)
             continue
 
-        sells_today_rec = _counter("sells_today", sym)
+        sells_today_rec = state_counter(state, "sells_today", sym, today)
+        buys_today_rec = state_counter(state, "buys_today", sym, today)
 
-        if max_sells_per_day > 0 and effective_signal == "Sälj" and sells_today_rec["count"] >= max_sells_per_day:
+        if effective_signal == "Sälj" and max_sells_per_day > 0 and sells_today_rec["count"] >= max_sells_per_day:
             log.info("[OWNED-SKIP] %s → MAX_SELLS_PER_DAY reached", sym)
-            update_signal_state(state, sym, effective_signal)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal)
             continue
 
-        if _in_cooldown(sym):
+        if effective_signal == "Köp" and max_buys_per_day > 0 and buys_today_rec["count"] >= max_buys_per_day:
+            log.info("[OWNED-SKIP] %s → MAX_BUYS_PER_DAY reached", sym)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal)
+            continue
+
+        if is_in_cooldown(state, sym, cooldown_min):
             log.info("[OWNED-SKIP] %s → cooldown", sym)
-            update_signal_state(state, sym, effective_signal)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal)
             continue
 
         if exit_mode == "full":
@@ -956,8 +539,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             qty = min(auto_qty, int(abs(current_pos)))
 
         if qty <= 0:
-            log.info("[OWNED-SKIP] %s -> no manageable position", sym)
-            update_signal_state(state, sym, effective_signal)
+            log.info("[OWNED-SKIP] %s → no manageable position", sym)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal)
             continue
 
         if effective_signal == "Sälj":
@@ -969,25 +552,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             event_name = "owned_cover_submitted"
             report_label = "BUY"
 
-        today_rec = _counter(today_bucket, sym)
-
-        if effective_signal == "Sälj" and max_sells_per_day > 0 and today_rec["count"] >= max_sells_per_day:
-            log.info("[OWNED-SKIP] %s → MAX_SELLS_PER_DAY reached", sym)
-            update_signal_state(state, sym, effective_signal)
-            continue
-
-        if effective_signal == "Köp" and max_buys_per_day > 0 and today_rec["count"] >= max_buys_per_day:
-            log.info("[OWNED-SKIP] %s → MAX_BUYS_PER_DAY reached", sym)
-            update_signal_state(state, sym, effective_signal)
-            continue
-
         if autotrade_enabled and risk_ok and market_ok:
             order_side = effective_signal
             key = f"{sym}:OWNED_{order_side}:{int(qty)}"
 
             if is_dup(key):
-                log.info("[OWNED-SKIP] %s → duplicerad ordernyckel", sym)
-                update_signal_state(state, sym, effective_signal)
+                log.info("[OWNED-SKIP] %s → duplicate order key", sym)
+                _apply_symbol_state(state, sym, curr_decision, effective_signal)
                 continue
 
             trade = None
@@ -1006,20 +577,20 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             if trade:
                 if order_side == "Sälj":
                     orders_sell += 1
+                    increment_day_counter(state, today_bucket, sym, today)
                     if exit_mode == "soft" and not missing_from_pipeline:
                         exit_state["soft_exit_done"] = True
                         set_exit_state(state, sym, exit_state)
                 else:
                     orders_buy += 1
+                    increment_day_counter(state, today_bucket, sym, today)
 
-                today_rec["count"] = int(today_rec.get("count", 0)) + 1
-                state[today_bucket][sym] = today_rec
-                state["last_trade_ts"][sym] = _now_utc().isoformat()
-                state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=exclude_bought_min)).isoformat()
+                mark_trade_timestamp(state, sym)
+                set_exclude_minutes(state, sym, exclude_bought_min)
 
                 owned_orders_for_report.append(
                     f"OWNED {report_label} submitted: {sym} x{qty} "
-                    f"(exit_mode={exit_mode}, reason={owned_reason}, stage={exit_state.get('stage')})"
+                    f"(exit_mode={exit_mode}, reason={owned_reason}, stage={exit_state.get('stage')}, source={analysis.get('data_source')})"
                 )
 
                 append_event(
@@ -1031,33 +602,35 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                         "exit_mode": exit_mode,
                         "exit_reason": owned_reason,
                         "exit_stage": exit_state.get("stage"),
+                        "data_source": analysis.get("data_source"),
                     },
                 )
             else:
-                debug_log(log, "[OWNED-KEEP] %s -> no real order sent", sym)
+                debug_log(log, "[OWNED-KEEP] %s → no real order sent", sym)
 
         else:
             why = []
             if not autotrade_enabled:
                 why.append("AUTOTRADE=off")
             if not risk_ok:
-                why.append("risk")
+                why.append(f"risk:{risk_reason}")
             if not market_ok:
                 why.append("market_closed")
 
             paper_tag = "OWNED-PAPER-SELL" if effective_signal == "Sälj" else "OWNED-PAPER-BUY"
 
             log.info(
-                "[%s] %s x%s | pris %s | score %s | action=%s | exit_mode=%s | reason=%s | stage=%s",
+                "[%s] %s x%s | price %s | score %s | action=%s | exit_mode=%s | reason=%s | stage=%s | source=%s",
                 paper_tag,
                 sym,
                 qty,
-                _fmt_price((analysis.get("raw_technicals") or {}).get("price")),
-                _fmt_score_plain(analysis.get("total_score")),
+                fmt_price((analysis.get("raw_technicals") or {}).get("price")),
+                fmt_score_plain(analysis.get("total_score")),
                 action,
                 exit_mode,
                 owned_reason,
                 exit_state.get("stage"),
+                analysis.get("data_source"),
             )
 
             if effective_signal == "Sälj" and exit_mode == "soft" and not missing_from_pipeline:
@@ -1066,10 +639,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             owned_orders_for_report.append(
                 f"OWNED PAPER-{effective_signal.upper()}: would {effective_signal.lower()} {sym} x{qty} "
-                f"(action={action}, timing={analysis.get('timing_state')}, "
-                f"quality={analysis.get('candidate_quality')}, score={analysis.get('total_score')}, "
-                f"exit_mode={exit_mode}, exit_reason={owned_reason}, exit_stage={exit_state.get('stage')}, "
-                f"{','.join(why) or '-'})"
+                f"(action={action}, timing={analysis.get('timing_state')}, quality={analysis.get('candidate_quality')}, "
+                f"score={analysis.get('total_score')}, exit_mode={exit_mode}, exit_reason={owned_reason}, "
+                f"exit_stage={exit_state.get('stage')}, source={analysis.get('data_source')}, {','.join(why) or '-'})"
             )
 
             append_event(
@@ -1087,17 +659,18 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     "exit_reason": owned_reason,
                     "exit_stage": exit_state.get("stage"),
                     "reason": ",".join(why) or "-",
+                    "data_source": analysis.get("data_source"),
                 },
             )
 
-        update_signal_state(state, sym, effective_signal)
+        _apply_symbol_state(state, sym, curr_decision, effective_signal)
 
     # =========================
     # SCAN CANDIDATES
     # =========================
     all_candidates = [
         s for s in by_sym.keys()
-        if s not in held and s not in open_buy_syms and not _is_excluded(s)
+        if s not in held and s not in open_buy_syms and not is_excluded(state, s)
     ]
 
     entry_candidates = []
@@ -1106,7 +679,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     for sym in all_candidates:
         stock = by_sym.get(sym) or {}
-        bucket = _candidate_bucket(stock)
+        bucket = candidate_bucket(stock)
 
         if bucket == "entry":
             entry_candidates.append(sym)
@@ -1115,27 +688,24 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         elif bucket == "fallback":
             fallback_candidates.append(sym)
 
-    entry_candidates = sorted(entry_candidates, key=_candidate_sort_key, reverse=True)
-    watch_candidates = sorted(watch_candidates, key=_candidate_sort_key, reverse=True)
-    fallback_candidates = sorted(fallback_candidates, key=_candidate_sort_key, reverse=True)
+    entry_candidates = sorted(entry_candidates, key=candidate_sort_key, reverse=True)
+    watch_candidates = sorted(watch_candidates, key=candidate_sort_key, reverse=True)
+    fallback_candidates = sorted(fallback_candidates, key=candidate_sort_key, reverse=True)
 
     tradable_entry_candidates = [
         s for s in entry_candidates
-        if _is_affordable(by_sym.get(s) or {}, auto_qty, max_order_value)
+        if is_affordable(by_sym.get(s) or {}, auto_qty, max_order_value)
     ]
 
-    non_tradable_entry_candidates = [
-        s for s in entry_candidates
-        if s not in tradable_entry_candidates
-    ]
+    non_tradable_entry_candidates = [s for s in entry_candidates if s not in tradable_entry_candidates]
 
     for s in non_tradable_entry_candidates[:10]:
         stock = by_sym.get(s) or {}
-        price = _to_float(stock.get("latestClose"), 0) or _to_float(((stock.get("_pipeline_technicals") or {}).get("price")), 0)
+        price = to_float(stock.get("latestClose"), 0) or to_float(((stock.get("_pipeline_technicals") or {}).get("price")), 0)
         est_value = (price or 0) * auto_qty
         debug_log(
             log,
-            "[ENTRY-SKIP] %s → ej affordable | price=%.2f qty=%s est=%.2f max=%.2f",
+            "[ENTRY-SKIP] %s → not affordable | price=%.2f qty=%s est=%.2f max=%.2f",
             s,
             price or 0.0,
             auto_qty,
@@ -1143,17 +713,16 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             max_order_value,
         )
 
-    candidate_source = _dedupe_keep_order(
+    candidate_source = dedupe_keep_order(
         tradable_entry_candidates
         + watch_candidates
         + fallback_candidates
     )
 
-    all_candidates = _dedupe_keep_order(all_candidates)
-
+    all_candidates = dedupe_keep_order(all_candidates)
     scan_seed = candidate_source[:]
 
-    replacement_source = _dedupe_keep_order(
+    replacement_source = dedupe_keep_order(
         [s for s in candidate_source if s not in scan_seed[:universe_rows]]
         + [s for s in all_candidates if s not in scan_seed[:universe_rows]]
     )
@@ -1172,65 +741,20 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     prev_uni = [s.upper() for s in state.get("universe", []) if s]
     scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, candidate_source, state)
-    scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
+    scan_set = dedupe_keep_order(scan_set)[:universe_rows]
 
     def _available_replacements(current_scan, banned=None):
-        banned = banned or set()
-        current_set = set(current_scan)
-
-        reason_counts = {
-            "in_current_scan": 0,
-            "banned": 0,
-            "held": 0,
-            "open_buy": 0,
-            "excluded": 0,
-            "bad_action": 0,
-            "accepted": 0,
-        }
-
-        pool = []
-        for s in replacement_source:
-            if s in current_set:
-                reason_counts["in_current_scan"] += 1
-                continue
-            if s in banned:
-                reason_counts["banned"] += 1
-                continue
-            if s in held:
-                reason_counts["held"] += 1
-                continue
-            if s in open_buy_syms:
-                reason_counts["open_buy"] += 1
-                continue
-            if _is_excluded(s):
-                reason_counts["excluded"] += 1
-                continue
-
-            stock = by_sym.get(s) or {}
-            analysis = _build_pipeline_analysis(stock)
-            action = str(analysis.get("action") or "").strip().lower()
-            held_pos = float(held.get(s, 0.0))
-
-            if not _is_allowed_replacement_action(action, held_pos):
-                reason_counts["bad_action"] += 1
-                continue
-
-            reason_counts["accepted"] += 1
-            pool.append(s)
-
-        debug_log(log, "[REPL-DEBUG] %s", reason_counts)
-
-        pool.sort(
-            key=lambda s: (
-                1 if str((_build_pipeline_analysis(by_sym.get(s) or {})).get("action", "")).lower() == "buy_ready" else 0,
-                int((_build_pipeline_analysis(by_sym.get(s) or {})).get("replacement_score", 0) or 0),
-                int((_build_pipeline_analysis(by_sym.get(s) or {})).get("entry_score", 0) or 0),
-                _quality_rank((_build_pipeline_analysis(by_sym.get(s) or {})).get("candidate_quality")),
-                int((_build_pipeline_analysis(by_sym.get(s) or {})).get("total_score", 0) or 0),
-            ),
-            reverse=True,
+        pool, reason_counts = available_replacements(
+            current_scan=current_scan,
+            replacement_source=replacement_source,
+            by_sym=by_sym,
+            analysis_cache=analysis_cache,
+            held=held,
+            open_buy_syms=open_buy_syms,
+            is_excluded_fn=lambda s: is_excluded(state, s),
+            banned=banned or set(),
         )
-
+        debug_log(log, "[REPL-DEBUG] %s", reason_counts)
         return pool
 
     def _take_replacement(current_scan, banned=None):
@@ -1241,17 +765,16 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     def _fill_scan_set(current_scan, banned=None):
         banned = banned or set()
-        current_scan = _dedupe_keep_order(current_scan)
+        current_scan = dedupe_keep_order(current_scan)
         while len(current_scan) < universe_rows:
             repl = _take_replacement(current_scan, banned=banned)
             if not repl:
                 break
             current_scan.append(repl)
-        return _dedupe_keep_order(current_scan)[:universe_rows]
+        return dedupe_keep_order(current_scan)[:universe_rows]
 
     scan_set = _fill_scan_set(scan_set, banned=removed_this_pass)
     state["universe"] = list(scan_set)
-
     replacement_pool_size = len(_available_replacements(scan_set, banned=removed_this_pass))
 
     if dropped_pre:
@@ -1259,16 +782,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     if added_pre:
         debug_log(log, "[PRE-ADD] %s", ", ".join(added_pre))
 
-    
-        
     rows_for_log = []
     for sym in scan_set:
         raw = by_sym.get(sym) or {}
         tech_price = ((raw.get("_pipeline_technicals") or {}).get("price"))
         shown_price = tech_price if tech_price is not None else raw.get("latestClose")
-        analysis = _build_pipeline_analysis(raw)
+        analysis = analysis_cache.get(sym) or build_pipeline_analysis(raw)
         rows_for_log.append(
-            f"{sym} {_fmt_price(shown_price)} [{analysis.get('candidate_quality')}]"
+            f"{sym} {fmt_price(shown_price)} [{analysis.get('candidate_quality')}]"
         )
 
     log.info(
@@ -1289,10 +810,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             continue
 
         raw = by_sym.get(sym) or {"symbol": sym, "name": sym}
-        stock = _normalize_stock(raw)
+        stock = normalize_stock(raw)
 
         try:
-            analysis = _build_pipeline_analysis(stock)
+            analysis = analysis_cache.get(sym) or build_pipeline_analysis(stock)
             signal = analysis["signal"]
 
             score = int(analysis.get("total_score", 0) or 0)
@@ -1309,12 +830,32 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             elif action == "exit_ready":
                 effective_signal = "Sälj"
 
-            _update_watchlist(state, sym, action, candidate_quality)
+            if effective_signal == "Sälj" and current_pos <= 0:
+                debug_log(
+                    log,
+                    "[INFO] %s → exit/bearish analysis, but no position exists. No sell action taken.",
+                    sym,
+                )
+                effective_signal = "Håll"
 
-            with open(str(SIGNAL_LOG_PATH), "a", encoding="utf-8") as f:
-                f.write(json.dumps(analysis, ensure_ascii=False) + "\n")
+            prev_decision = get_decision_state(state, sym)
 
-            trim_jsonl(str(SIGNAL_LOG_PATH), keep_last=5000)
+            curr_decision = build_decision_snapshot(
+                signal=effective_signal,
+                action=action,
+                timing_state=timing_state,
+                pressure=None,
+                exit_mode="scan",
+                exit_stage=0,
+                score=score,
+                retention_score=retention_score,
+            )
+            material_change, changed_fields = is_material_change(prev_decision, curr_decision)
+
+            if material_change:
+                with open(str(SIGNAL_LOG_PATH), "a", encoding="utf-8") as f:
+                    f.write(json.dumps(analysis, ensure_ascii=False) + "\n")
+                trim_jsonl(str(SIGNAL_LOG_PATH), keep_last=5000)
 
         except Exception as e:
             signal = "Håll"
@@ -1338,8 +879,21 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 "replacement_score": replacement_score,
                 "raw_technicals": {},
                 "error": str(e),
-                "timestamp": _now_utc().isoformat(),
+                "timestamp": now_utc().isoformat(),
             }
+
+            prev_decision = get_decision_state(state, sym)
+            curr_decision = build_decision_snapshot(
+                signal=effective_signal,
+                action=action,
+                timing_state=timing_state,
+                pressure=None,
+                exit_mode="scan",
+                exit_stage=0,
+                score=score,
+                retention_score=retention_score,
+            )
+            material_change, changed_fields = is_material_change(prev_decision, curr_decision)
 
         raw_technicals = analysis.get("raw_technicals") or {}
 
@@ -1349,20 +903,21 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         analysis_row["held_position"] = float(held.get(sym, 0.0))
         scan_results.append(analysis_row)
 
-        prev_sig = state["last_signal"].get(sym)
+        if material_change:
+            append_event(
+                "signal_evaluated",
+                symbol=sym,
+                name=raw.get("name") or raw.get("companyName") or sym,
+                data={
+                    "signal": signal,
+                    "effective_signal": effective_signal,
+                    "score": analysis.get("total_score"),
+                    "price": raw_technicals.get("price"),
+                    "changed_fields": changed_fields,
+                },
+            )
 
-        append_event(
-            "signal_evaluated",
-            symbol=sym,
-            name=raw.get("name") or raw.get("companyName") or sym,
-            data={
-                "signal": signal,
-                "score": analysis.get("total_score"),
-                "price": raw_technicals.get("price"),
-            },
-        )
-
-        if effective_signal == "Köp" and prev_sig != "Köp":
+        if effective_signal == "Köp" and prev_decision.get("signal") != "Köp":
             append_event(
                 "buy_signal",
                 symbol=sym,
@@ -1370,24 +925,25 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 data={
                     "score": analysis.get("total_score"),
                     "price": raw_technicals.get("price"),
+                    "event_kind": "new_buy_signal",
                 },
             )
 
         if sym == "BRK-B" and not raw_technicals.get("price"):
             debug_log(log, "[KEEP] %s → IB technicals still missing, temporarily kept", sym)
-            update_signal_state(state, sym, effective_signal)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
             continue
 
         if not raw_technicals:
             debug_log(log, "[KEEP] %s → technicals missing, kept in universe", sym)
-            update_signal_state(state, sym, effective_signal)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
             continue
 
         drop_reason = None
         hold_streak = int(state.get("hold_streak", {}).get(sym, 0))
         effective_hold_streak = hold_streak + 1 if effective_signal == "Håll" else 0
 
-        rotate_by_profile, rotate_reason = _should_rotate_candidate(
+        rotate_by_profile, rotate_reason = should_rotate_candidate(
             action=action,
             retention_score=retention_score,
             quality=candidate_quality,
@@ -1395,7 +951,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         )
 
         if entry_mode == "buy_only":
-            if not _is_buy_action(action):
+            if action != "buy_ready":
                 drop_reason = f"replace due to action={action}"
         elif entry_mode == "all":
             if rotate_by_profile:
@@ -1403,7 +959,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             elif (
                 market_ok
                 and action == "watch"
-                and effective_hold_streak >= DROP_IF_HOLD_STREAK
+                and effective_hold_streak >= drop_if_hold_streak
                 and current_pos <= 0
                 and retention_score <= 6
             ):
@@ -1426,13 +982,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 retention_score,
                 replacement_score,
             )
+
             if not repl:
                 debug_log(log, "[KEEP] %s → %s but no replacement is available", sym, drop_reason)
-                update_signal_state(state, sym, effective_signal)
+                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                 continue
 
             repl_raw = by_sym.get(repl) or {}
-            repl_analysis = _build_pipeline_analysis(repl_raw)
+            repl_analysis = analysis_cache.get(repl) or build_pipeline_analysis(repl_raw)
 
             debug_log(
                 log,
@@ -1448,13 +1005,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 repl_analysis.get("candidate_quality"),
             )
 
-            if not _replacement_is_meaningfully_better(
+            if not replacement_is_meaningfully_better(
                 analysis,
-                repl_raw,
+                repl_analysis,
                 watch_streak=effective_hold_streak,
             ):
                 debug_log(log, "[KEEP] %s → replacement %s is not clearly better", sym, repl)
-                update_signal_state(state, sym, effective_signal)
+                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                 continue
 
             if sym in scan_set:
@@ -1478,12 +1035,11 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 reason=drop_reason,
             )
 
-            update_signal_state(state, sym, effective_signal)
-            state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=pass_ex_min)).isoformat()
+            set_exclude_minutes(state, sym, pass_ex_min)
             reset_symbol_rotation_state(state, sym)
 
             scan_set.append(repl)
-            scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
+            scan_set = dedupe_keep_order(scan_set)[:universe_rows]
             added.append(repl)
 
             log.info("[ADD] %s → replaces %s", repl, sym)
@@ -1502,50 +1058,45 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             )
             continue
 
-        if only_trade_on_signal_change and prev_sig == effective_signal:
-            update_signal_state(state, sym, effective_signal)
+        if only_trade_on_signal_change and prev_decision.get("signal") == effective_signal:
+            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
             continue
 
-        buys_today_rec = _counter("buys_today", sym)
-        sells_today_rec = _counter("sells_today", sym)
+        buys_today_rec = state_counter(state, "buys_today", sym, today)
+        sells_today_rec = state_counter(state, "sells_today", sym, today)
 
         if effective_signal == "Köp" and max_buys_per_day > 0 and buys_today_rec["count"] >= max_buys_per_day:
-            update_signal_state(state, sym, effective_signal)
             log.info("[SKIP] %s → MAX_BUYS_PER_DAY reached", sym)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
             continue
 
         if effective_signal == "Sälj" and max_sells_per_day > 0 and sells_today_rec["count"] >= max_sells_per_day:
-            update_signal_state(state, sym, effective_signal)
             log.info("[SKIP] %s → MAX_SELLS_PER_DAY reached", sym)
+            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
             continue
 
         current_pos = float(held.get(sym, 0.0))
         qty = auto_qty
         trade = None
 
-        if effective_signal == "Sälj" and current_pos <= 0:
-            debug_log(log, "[INFO] %s → exit/bearish analysis, but no position exists. No sell action taken.", sym)
-            effective_signal = "Håll"
-
-        if autotrade_enabled and risk_ok and market_ok and not _in_cooldown(sym):
+        if autotrade_enabled and risk_ok and market_ok and not is_in_cooldown(state, sym, cooldown_min):
             action_signal = effective_signal
 
             if action_signal == "Sälj" and current_pos <= 0:
-                log.info("[SKIP] %s -> sell ignored, no position to close", sym)
-                update_signal_state(state, sym, effective_signal)
+                log.info("[SKIP] %s → sell ignored, no position to close", sym)
+                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                 continue
 
             if action_signal == "Köp" and entries_this_pass >= max_new_entries_per_pass:
                 log.info("[SKIP] %s → MAX_NEW_ENTRIES_PER_PASS reached", sym)
-                update_signal_state(state, sym, effective_signal)
+                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                 continue
-
 
             if action_signal == "Köp" and max_pos_per_symbol > 0:
                 remaining_cap = max(0, max_pos_per_symbol - int(current_pos))
                 if remaining_cap <= 0:
                     log.info("[SKIP] %s → MAX_POS_PER_SYMBOL reached", sym)
-                    update_signal_state(state, sym, effective_signal)
+                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                     continue
                 qty = min(auto_qty, remaining_cap)
 
@@ -1553,16 +1104,16 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 qty = min(auto_qty, int(current_pos))
                 if qty <= 0:
                     log.info("[SKIP] %s → no sellable position", sym)
-                    update_signal_state(state, sym, effective_signal)
+                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                     continue
 
-            price_now = _to_float(raw_technicals.get("price"), 0) or _to_float(raw.get("latestClose"), 0)
+            price_now = to_float(raw_technicals.get("price"), 0) or to_float(raw.get("latestClose"), 0)
 
             if action_signal == "Köp" and price_now > 0:
                 est_value = price_now * qty
                 if est_value > max_order_value:
-                    log.info("[SKIP] %s → ordervärde %.2f över max %.2f", sym, est_value, max_order_value)
-                    update_signal_state(state, sym, effective_signal)
+                    log.info("[SKIP] %s → order value %.2f exceeds max %.2f", sym, est_value, max_order_value)
+                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
                     continue
 
             key = f"{sym}:{action_signal}:{int(qty)}"
@@ -1585,8 +1136,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     if action_signal == "Köp":
                         entries_this_pass += 1
                         orders_buy += 1
-                        buys_today_rec["count"] = int(buys_today_rec.get("count", 0)) + 1
-                        state["buys_today"][sym] = buys_today_rec
+                        increment_day_counter(state, "buys_today", sym, today)
 
                         log_signal_line(log, "BUY", sym, qty, raw_technicals.get("price"), analysis.get("total_score"))
 
@@ -1600,8 +1150,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
                     elif action_signal == "Sälj":
                         orders_sell += 1
-                        sells_today_rec["count"] = int(sells_today_rec.get("count", 0)) + 1
-                        state["sells_today"][sym] = sells_today_rec
+                        increment_day_counter(state, "sells_today", sym, today)
 
                         log_signal_line(log, "EXIT", sym, qty, raw_technicals.get("price"), analysis.get("total_score"))
 
@@ -1613,8 +1162,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                             data={"qty": qty},
                         )
 
-                    state["exclude_until"][sym] = (_now_utc() + timedelta(minutes=exclude_bought_min)).isoformat()
-                    state["last_trade_ts"][sym] = _now_utc().isoformat()
+                    set_exclude_minutes(state, sym, exclude_bought_min)
+                    mark_trade_timestamp(state, sym)
 
                     if sym in scan_set:
                         scan_set.remove(sym)
@@ -1624,7 +1173,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     reset_symbol_rotation_state(state, sym)
 
                     reason_txt = "bought" if action_signal == "Köp" else "sold"
-                    log.info("[REMOVE] %s -> %s + excluded %d min", sym, reason_txt, exclude_bought_min)
+                    log.info("[REMOVE] %s → %s + excluded %d min", sym, reason_txt, exclude_bought_min)
 
                     rotations_out.append({
                         "symbol": sym,
@@ -1642,7 +1191,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     repl = _take_replacement(scan_set, banned=removed_this_pass)
                     if repl:
                         scan_set.append(repl)
-                        scan_set = _dedupe_keep_order(scan_set)[:universe_rows]
+                        scan_set = dedupe_keep_order(scan_set)[:universe_rows]
                         added.append(repl)
                         log.info("[ADD] %s → replaces %s", repl, sym)
 
@@ -1661,60 +1210,65 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 else:
                     debug_log(log, "[KEEP] %s → no real order, kept in universe", sym)
             else:
-                log.info("[SKIP] %s → duplicerad ordernyckel", sym)
+                log.info("[SKIP] %s → duplicate order key", sym)
+                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                continue
+
         else:
             why = []
             if not autotrade_enabled:
                 why.append("AUTOTRADE=off")
             if not risk_ok:
-                why.append("risk")
+                why.append(f"risk:{risk_reason}")
             if not market_ok:
                 why.append("market_closed")
-            if _in_cooldown(sym):
+            if is_in_cooldown(state, sym, cooldown_min):
                 why.append("cooldown")
 
             if effective_signal in {"Köp", "Sälj"}:
                 if effective_signal == "Köp":
                     paper_buy += 1
                     log.info(
-                        "[PAPER-BUY] %s x%s | pris %s | score %s | action=%s",
+                        "[PAPER-BUY] %s x%s | price %s | score %s | action=%s",
                         sym,
                         qty,
-                        _fmt_price(raw_technicals.get("price")),
-                        _fmt_score_plain(analysis.get("total_score")),
+                        fmt_price(raw_technicals.get("price")),
+                        fmt_score_plain(analysis.get("total_score")),
                         action,
                     )
                 elif effective_signal == "Sälj":
                     paper_sell += 1
                     log.info(
-                        "[PAPER-SELL] %s x%s | pris %s | score %s | action=%s",
+                        "[PAPER-SELL] %s x%s | price %s | score %s | action=%s",
                         sym,
                         qty,
-                        _fmt_price(raw_technicals.get("price")),
-                        _fmt_score_plain(analysis.get("total_score")),
+                        fmt_price(raw_technicals.get("price")),
+                        fmt_score_plain(analysis.get("total_score")),
                         action,
                     )
 
                 paper_symbols.append(f"{effective_signal}:{sym}")
 
-                append_event(
-                    "paper_signal",
-                    symbol=sym,
-                    name=raw.get("name") or raw.get("companyName") or sym,
-                    data={
-                        "signal": effective_signal,
-                        "pipeline_signal": signal,
-                        "action": action,
-                        "timing_state": timing_state,
-                        "candidate_quality": candidate_quality,
-                        "qty": qty,
-                        "reason": ",".join(why) or "-",
-                        "score": analysis.get("total_score"),
-                        "retention_score": retention_score,
-                        "replacement_score": replacement_score,
-                        "price": raw_technicals.get("price"),
-                    },
-                )
+                if material_change:
+                    append_event(
+                        "paper_signal",
+                        symbol=sym,
+                        name=raw.get("name") or raw.get("companyName") or sym,
+                        data={
+                            "signal": effective_signal,
+                            "pipeline_signal": signal,
+                            "action": action,
+                            "timing_state": timing_state,
+                            "candidate_quality": candidate_quality,
+                            "qty": qty,
+                            "reason": ",".join(why) or "-",
+                            "score": analysis.get("total_score"),
+                            "retention_score": retention_score,
+                            "replacement_score": replacement_score,
+                            "price": raw_technicals.get("price"),
+                            "changed_fields": changed_fields,
+                        },
+                    )
 
                 orders_for_report.append(
                     f"PAPER-SIM: would {effective_signal.lower()} {sym} x{qty} "
@@ -1722,7 +1276,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     f"price={raw_technicals.get('price')}, score={analysis.get('total_score')}, {','.join(why) or '-'})"
                 )
 
-        update_signal_state(state, sym, effective_signal)
+        if sym in removed_this_pass:
+            continue
+
+        _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
 
     scan_set = _fill_scan_set(scan_set, banned=removed_this_pass)
 
@@ -1732,7 +1289,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             len(scan_set),
             universe_rows,
         )
-    # state["universe"] används här som aktivt scan_set, inte hela pipeline-universe
+
     state["universe"] = list(scan_set)
     replacement_pool_size = len(_available_replacements(scan_set, banned=removed_this_pass))
 
@@ -1762,7 +1319,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         orders=orders_for_report + owned_orders_for_report,
     )
 
-    state["watchlist"] = _dedupe_keep_order(
+    state["watchlist"] = dedupe_keep_order(
         [r["symbol"] for r in scan_results if str(r.get("action") or "").lower() == "watch"]
     )
 
@@ -1789,8 +1346,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     scan_exit_soon_syms = [r["symbol"] for r in scan_results if str(r.get("action") or "").lower() == "sell_candidate"]
     scan_exit_watch_syms = [r["symbol"] for r in scan_results if str(r.get("action") or "").lower() == "exit_watch"]
 
-    
-
     if state.get("watchlist"):
         debug_log(log, "[WATCHLIST] %s", ", ".join(state["watchlist"]))
 
@@ -1800,17 +1355,16 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     log_section(log, "OWNED SUMMARY")
     held_syms = sorted(list(held.keys()))
     open_buy_list = sorted(list(open_buy_syms))
-   
-    log.info("%s %s", _c("OWNED       :", _CYAN, bold=True), fmt_sym_list(held_syms))
-    log.info("%s %s", _c("OPEN BUYS  :", _BLUE, bold=True), fmt_sym_list(open_buy_list))
-    log.info("%s %s", _c("STRONG     :", _GREEN, bold=True), fmt_sym_list(portfolio_grouped["buy_ready"]))
-    log.info("%s %s", _c("EXIT NOW   :", _RED, bold=True), fmt_sym_list(portfolio_grouped["exit_ready"]))
-    log.info("%s %s", _c("EXIT SOON  :", _YELLOW, bold=True), fmt_sym_list(portfolio_grouped["sell_candidate"]))
-    log.info("%s %s", _c("EXIT WATCH :", _CYAN, bold=True), fmt_sym_list(portfolio_grouped["exit_watch"]))
-    log.info("%s %s", _c("WAIT       :", _BLUE, bold=True), fmt_sym_list(portfolio_grouped["watch"]))
-    log.info("%s %s", _c("HOLD       :", _YELLOW, bold=True), fmt_sym_list(portfolio_grouped["hold"]))
-    log.info("%s %s", _c("CHECK      :", _RED, bold=True), fmt_sym_list(portfolio_grouped["review"]))
 
+    log.info("%s %s", _c("OWNED       :", _CYAN, bold=True), fmt_sym_list(held_syms))
+    log.info("%s %s", _c("OPEN BUYS   :", _BLUE, bold=True), fmt_sym_list(open_buy_list))
+    log.info("%s %s", _c("STRONG      :", _GREEN, bold=True), fmt_sym_list(portfolio_grouped["buy_ready"]))
+    log.info("%s %s", _c("EXIT NOW    :", _RED, bold=True), fmt_sym_list(portfolio_grouped["exit_ready"]))
+    log.info("%s %s", _c("EXIT SOON   :", _YELLOW, bold=True), fmt_sym_list(portfolio_grouped["sell_candidate"]))
+    log.info("%s %s", _c("EXIT WATCH  :", _CYAN, bold=True), fmt_sym_list(portfolio_grouped["exit_watch"]))
+    log.info("%s %s", _c("WAIT        :", _BLUE, bold=True), fmt_sym_list(portfolio_grouped["watch"]))
+    log.info("%s %s", _c("HOLD        :", _YELLOW, bold=True), fmt_sym_list(portfolio_grouped["hold"]))
+    log.info("%s %s", _c("CHECK       :", _RED, bold=True), fmt_sym_list(portfolio_grouped["review"]))
 
     log_section(log, "SCAN SUMMARY")
     log.info(
@@ -1840,7 +1394,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         int((state.get("buys_today", {}) or {}).get(sym, {}).get("count", 0) or 0)
         for sym in (state.get("buys_today", {}) or {})
     )
-
     today_sell_total = sum(
         int((state.get("sells_today", {}) or {}).get(sym, {}).get("count", 0) or 0)
         for sym in (state.get("sells_today", {}) or {})
@@ -1856,13 +1409,12 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     top_buys = [r for r in scan_results if str(r.get("action") or "").lower() == "buy_ready"][:4]
     top_watch = [r for r in scan_results if str(r.get("action") or "").lower() == "watch"][:3]
     top_exit = [r for r in scan_results if str(r.get("action") or "").lower() in {"exit_ready", "sell_candidate", "exit_watch"}][:3]
+    top_hold = [r for r in scan_results if str(r.get("action") or "").lower() == "hold_candidate"][:3]
 
     if top_buys:
         log.info("%s", _c("WHY BUY:", _GREEN, bold=True))
         for row in top_buys:
             log.info("  %s", short_reason_line(row))
-    
-    top_hold = [r for r in scan_results if str(r.get("action") or "").lower() == "hold_candidate"][:3]
 
     if top_hold:
         log.info("%s", _c("WHY HOLD:", _YELLOW, bold=True))
@@ -1878,7 +1430,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         log.info("%s", _c("WHY EXIT:", _RED, bold=True))
         for row in top_exit:
             log.info("  %s", short_reason_line(row))
-
 
     log.info(
         "%s raw=%d | s1=%d | s2=%d | s3=%d | final=%d | candidates=%d | replacements=%d",

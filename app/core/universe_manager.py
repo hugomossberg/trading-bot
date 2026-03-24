@@ -1,3 +1,4 @@
+#universe_manager.py
 import os
 import json
 from datetime import datetime, timezone
@@ -57,17 +58,32 @@ def _default_exit_state():
     }
 
 
+def _default_decision_state():
+    return {
+        "signal": None,
+        "action": None,
+        "timing_state": None,
+        "pressure": None,
+        "exit_mode": None,
+        "exit_stage": 0,
+        "score_bucket": None,
+        "retention_bucket": None,
+        "state_label": None,
+        "updated_at": None,
+    }
+
 def load_state():
     state = {
         "hold_streak": {},
         "last_signal": {},
-        "universe": [],  # används som aktivt scan_set
+        "universe": [],
         "last_trade_ts": {},
         "buys_today": {},
         "sells_today": {},
         "exclude_until": {},
         "watchlist": [],
         "exit_state": {},
+        "decision_state": {},
     }
 
     if os.path.exists(STATE_PATH):
@@ -88,6 +104,7 @@ def load_state():
     state.setdefault("exclude_until", {})
     state.setdefault("watchlist", [])
     state.setdefault("exit_state", {})
+    state.setdefault("decision_state", {})
 
     state["universe"] = _dedupe_keep_order(state.get("universe", []))
 
@@ -132,6 +149,38 @@ def load_state():
         normalized_exit_state[sym_up] = base
 
     state["exit_state"] = normalized_exit_state
+
+    if not isinstance(state.get("decision_state"), dict):
+        state["decision_state"] = {}
+
+    normalized_decision_state = {}
+    for sym, data in state["decision_state"].items():
+        sym_up = str(sym).upper().strip()
+        if not sym_up:
+            continue
+
+        base = _default_decision_state()
+        if isinstance(data, dict):
+            base.update(data)
+
+        try:
+            base["exit_stage"] = int(base.get("exit_stage", 0) or 0)
+        except Exception:
+            base["exit_stage"] = 0
+
+        base["signal"] = base.get("signal")
+        base["action"] = base.get("action")
+        base["timing_state"] = base.get("timing_state")
+        base["pressure"] = base.get("pressure")
+        base["exit_mode"] = base.get("exit_mode")
+        base["score_bucket"] = base.get("score_bucket")
+        base["retention_bucket"] = base.get("retention_bucket")
+        base["state_label"] = base.get("state_label")
+        base["updated_at"] = base.get("updated_at")
+
+        normalized_decision_state[sym_up] = base
+
+    state["decision_state"] = normalized_decision_state
 
     return state
 
@@ -224,6 +273,46 @@ def set_exit_state(state, sym: str, exit_state: dict):
     state["exit_state"][sym] = merged
 
 
+def get_decision_state(state, sym: str) -> dict:
+    sym = str(sym).upper().strip()
+    if not sym:
+        return _default_decision_state()
+
+    state.setdefault("decision_state", {})
+
+    current = state["decision_state"].get(sym)
+    if not isinstance(current, dict):
+        current = _default_decision_state()
+        state["decision_state"][sym] = current
+        return current
+
+    merged = _default_decision_state()
+    merged.update(current)
+    state["decision_state"][sym] = merged
+    return merged
+
+
+def set_decision_state(state, sym: str, decision_state: dict):
+    sym = str(sym).upper().strip()
+    if not sym:
+        return
+
+    state.setdefault("decision_state", {})
+
+    merged = _default_decision_state()
+    if isinstance(decision_state, dict):
+        merged.update(decision_state)
+
+    try:
+        merged["exit_stage"] = int(merged.get("exit_stage", 0) or 0)
+    except Exception:
+        merged["exit_stage"] = 0
+
+    merged["updated_at"] = _now_utc().isoformat()
+    state["decision_state"][sym] = merged
+
+
+
 def reset_exit_state(state, sym: str):
     sym = str(sym).upper().strip()
     if not sym:
@@ -246,11 +335,12 @@ def reset_symbol_rotation_state(state, sym: str):
     state.setdefault("hold_streak", {})
     state.setdefault("last_signal", {})
     state.setdefault("exit_state", {})
+    state.setdefault("decision_state", {})
 
     state["hold_streak"].pop(sym, None)
     state["last_signal"].pop(sym, None)
     state["exit_state"].pop(sym, None)
-
+    state["decision_state"].pop(sym, None)
 
 def rotate_universe(prev_uni, candidates, state):
     """
@@ -277,6 +367,7 @@ def rotate_universe(prev_uni, candidates, state):
     state.setdefault("universe", [])
     state.setdefault("exclude_until", {})
     state.setdefault("exit_state", {})
+    state.setdefault("decision_state", {})
 
     prefer_non_hold = os.getenv("PREFER_NON_HOLD", "1").lower() in {"1", "true", "yes", "on"}
 
