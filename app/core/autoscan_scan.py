@@ -32,13 +32,6 @@ def candidate_bucket(stock: dict) -> str | None:
     ):
         return "fallback"
 
-    if (
-        action == "sell_candidate"
-        and quality in {"A+", "A", "B"}
-        and retention_score >= 6
-    ):
-        return "fallback"
-
     return None
 
 
@@ -59,7 +52,7 @@ def is_allowed_replacement_action(action: str, held_pos: float = 0.0) -> bool:
         return True
 
     if action == "sell_candidate" and held_pos <= 0:
-        return True  # tillåts fortfarande, men filtreras hårdare senare
+        return True
 
     if action == "exit_ready":
         return held_pos > 0
@@ -119,14 +112,13 @@ def replacement_is_meaningfully_better(
     current_retention = int(current_analysis.get("retention_score", current_analysis.get("total_score", 0)) or 0)
     current_quality = current_analysis.get("candidate_quality")
     current_action = str(current_analysis.get("action") or "").strip().lower()
-    current_score = int(current_analysis.get("total_score", 0) or 0)
 
-    repl_replacement_score = int(replacement_analysis.get("replacement_score", replacement_analysis.get("total_score", 0)) or 0)
+    repl_replacement_score = int(
+        replacement_analysis.get("replacement_score", replacement_analysis.get("total_score", 0)) or 0
+    )
     repl_quality = replacement_analysis.get("candidate_quality")
     repl_action = str(replacement_analysis.get("action") or "").strip().lower()
-    repl_score = int(replacement_analysis.get("total_score", 0) or 0)
 
-    # tydlig favorit: buy_ready replacement mot något som inte själv är buy_ready
     if repl_action == "buy_ready" and current_action not in {"buy_ready", "hold_position"}:
         return True
 
@@ -136,13 +128,6 @@ def replacement_is_meaningfully_better(
         current_quality=current_quality,
         current_retention=current_retention,
     )
-
-    # sell_candidate replacement måste vara tydligt bättre, annars nej
-    if repl_action == "sell_candidate":
-        if repl_replacement_score < current_retention + max(2, required_delta):
-            return False
-        if repl_score < current_score:
-            return False
 
     if repl_replacement_score >= current_retention + required_delta:
         return True
@@ -184,42 +169,64 @@ def build_analysis_cache(by_sym: dict) -> dict:
     return {sym: build_pipeline_analysis(stock) for sym, stock in (by_sym or {}).items()}
 
 
-def _passes_replacement_prefilter(analysis: dict) -> tuple[bool, str]:
-    """
-    Grov gate för replacement-poolen.
-    Målet är inte att stoppa rotation, utan att stoppa riktigt svaga replacements
-    från att skapa compare-brus.
-    """
+def _replacement_profile(analysis: dict) -> str:
     action = str(analysis.get("action") or "").strip().lower()
-    replacement_score = int(analysis.get("replacement_score", analysis.get("total_score", 0)) or 0)
-    entry_score = int(analysis.get("entry_score", 0) or 0)
+    quality = str(analysis.get("candidate_quality") or "").upper()
+    q_rank = quality_rank(quality)
+
     total_score = int(analysis.get("total_score", 0) or 0)
-    q_rank = quality_rank(analysis.get("candidate_quality"))
+    retention = int(analysis.get("retention_score", total_score) or 0)
+    replacement_score = int(analysis.get("replacement_score", total_score) or 0)
+    entry_score = int(analysis.get("entry_score", 0) or 0)
 
-    # alltid bra replacement-klass
-    if action == "buy_ready":
-        return True, "buy_ready"
+    if (
+        action == "buy_ready"
+        and q_rank >= 3
+        and replacement_score >= 6
+        and entry_score >= 3
+        and total_score >= 3
+    ):
+        return "upgrade"
 
-    # watch/hold får vara replacements om de åtminstone har okej styrka
-    if action in {"watch", "hold_candidate", "hold_position"}:
-        if replacement_score >= 4 and q_rank >= 2:
-            return True, "watch_ok"
-        return False, "weak_watch"
+    if (
+        action in {"watch", "hold_candidate", "buy_ready"}
+        and q_rank >= 2
+        and retention >= 4
+        and replacement_score >= 4
+        and total_score >= 1
+    ):
+        return "stable"
 
-    # sell_candidate får bara vara kvar som replacement om den ändå har hygglig kvalitet
-    # annars skapar de bara compare-brus
-    if action == "sell_candidate":
-        if replacement_score >= 6 and total_score >= 3 and q_rank >= 3:
-            return True, "strong_sell_candidate"
-        return False, "weak_sell_candidate"
+    if (
+        action in {"watch", "hold_candidate", "buy_ready", "sell_candidate", "review_needed", "exit_watch"}
+        and q_rank >= 2
+        and retention >= 3
+        and replacement_score >= 2
+    ):
+        return "fallback"
 
-    # exit_watch / review_needed = väldigt svag replacementklass
-    if action in {"exit_watch", "review_needed"}:
-        if replacement_score >= 7 and q_rank >= 3:
-            return True, "borderline_ok"
-        return False, "weak_borderline"
+    if (
+        action == "sell_candidate"
+        and q_rank >= 3
+        and retention >= 5
+        and replacement_score >= 3
+    ):
+        return "fallback"
 
-    return False, "bad_action_profile"
+    return "reject"
+
+
+def _replacement_rank_tuple(analysis: dict) -> tuple:
+    action = str(analysis.get("action") or "").strip().lower()
+    return (
+        1 if action == "buy_ready" else 0,
+        1 if action in {"watch", "hold_candidate"} else 0,
+        int(analysis.get("replacement_score", analysis.get("total_score", 0)) or 0),
+        int(analysis.get("retention_score", analysis.get("total_score", 0)) or 0),
+        int(analysis.get("entry_score", 0) or 0),
+        quality_rank(analysis.get("candidate_quality")),
+        int(analysis.get("total_score", 0) or 0),
+    )
 
 
 def available_replacements(
@@ -247,7 +254,9 @@ def available_replacements(
         "accepted": 0,
     }
 
-    pool = []
+    upgrade_pool: list[str] = []
+    stable_pool: list[str] = []
+    fallback_pool: list[str] = []
 
     for s in replacement_source:
         if s in current_set:
@@ -274,23 +283,23 @@ def available_replacements(
             reason_counts["bad_action"] += 1
             continue
 
-        passes, _why = _passes_replacement_prefilter(analysis)
-        if not passes:
+        profile = _replacement_profile(analysis)
+
+        if profile == "upgrade":
+            upgrade_pool.append(s)
+            reason_counts["accepted"] += 1
+        elif profile == "stable":
+            stable_pool.append(s)
+            reason_counts["accepted"] += 1
+        elif profile == "fallback":
+            fallback_pool.append(s)
+            reason_counts["accepted"] += 1
+        else:
             reason_counts["weak_profile"] += 1
-            continue
 
-        reason_counts["accepted"] += 1
-        pool.append(s)
+    upgrade_pool.sort(key=lambda s: _replacement_rank_tuple(analysis_cache.get(s) or {}), reverse=True)
+    stable_pool.sort(key=lambda s: _replacement_rank_tuple(analysis_cache.get(s) or {}), reverse=True)
+    fallback_pool.sort(key=lambda s: _replacement_rank_tuple(analysis_cache.get(s) or {}), reverse=True)
 
-    pool.sort(
-        key=lambda s: (
-            1 if str((analysis_cache.get(s) or {}).get("action", "")).lower() == "buy_ready" else 0,
-            int((analysis_cache.get(s) or {}).get("replacement_score", 0) or 0),
-            int((analysis_cache.get(s) or {}).get("entry_score", 0) or 0),
-            quality_rank((analysis_cache.get(s) or {}).get("candidate_quality")),
-            int((analysis_cache.get(s) or {}).get("total_score", 0) or 0),
-        ),
-        reverse=True,
-    )
-
+    pool = upgrade_pool + stable_pool + fallback_pool
     return pool, reason_counts

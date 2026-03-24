@@ -5,15 +5,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import STOCK_INFO_PATH
+from app.core.helpers import market_open_now
 from app.core.market_profile import PROFILE, MARKET_PROFILE
 from app.data.market_data import MarketDataService
-from app.core.helpers import market_open_now
 
 log = logging.getLogger("scanner")
 md = MarketDataService()
 
+# gamla / ogiltiga / problematiska ticker-symboler
+_BAD_IB_SYMBOLS = {
+    "CCIV",
+    "TWTR",
+    "NETE",
+    "ANTM",
+    "ATVI",
+}
 
-_BAD_IB_SYMBOLS = {"CCIV", "TWTR", "NETE"}
+# symboler som i praktiken bör undvikas redan i scanner-lagret
+_STALE_OR_DELISTED_SYMBOLS = {
+    "CCIV",
+    "TWTR",
+    "NETE",
+    "ANTM",
+    "ATVI",
+}
 
 
 def _env_int(key: str, default: int) -> int:
@@ -21,6 +36,13 @@ def _env_int(key: str, default: int) -> int:
         return int(os.getenv(key, str(default)))
     except Exception:
         return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = os.getenv(key, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on", "y"}
 
 
 def _to_float(x, default=None):
@@ -45,35 +67,6 @@ def _write_stock_info(rows: list[dict]):
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
 
-def _built_today(path: str) -> bool:
-    p = Path(path)
-    if not p.exists():
-        return False
-
-    try:
-        mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).date()
-        today = datetime.now(timezone.utc).date()
-        return mtime == today
-    except Exception:
-        return False
-
-def should_rebuild_stock_info(path: str, min_rows: int, current_rows: int) -> tuple[bool, str]:
-    p = Path(path)
-
-    if not p.exists():
-        return True, "saknas"
-
-    if market_open_now():
-        return False, "marknaden öppen, använd befintlig fil"
-
-    if not _built_today(path):
-        return True, "ny dag före öppning"
-
-    if current_rows < min_rows:
-        return True, f"otillräcklig ({current_rows}/{min_rows})"
-
-    return False, "fil ok"
-
 def _read_stock_info() -> list[dict] | None:
     try:
         with open(STOCK_INFO_PATH, "r", encoding="utf-8") as f:
@@ -81,6 +74,67 @@ def _read_stock_info() -> list[dict] | None:
         return data if isinstance(data, list) else None
     except Exception:
         return None
+
+
+def _file_age_minutes(path: str) -> float | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        age_sec = max(0.0, datetime.now(timezone.utc).timestamp() - p.stat().st_mtime)
+        return age_sec / 60.0
+    except Exception:
+        return None
+
+
+def _built_today(path: str) -> bool:
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).date()
+        today = datetime.now(timezone.utc).date()
+        return mtime == today
+    except Exception:
+        return False
+
+
+def should_rebuild_stock_info(path: str, min_rows: int, current_rows: int) -> tuple[bool, str]:
+    p = Path(path)
+
+    if _env_bool("SCANNER_DISABLE_CACHE", False):
+        return True, "SCANNER_DISABLE_CACHE=on"
+
+    if _env_bool("FORCE_UNIVERSE_REBUILD", False):
+        return True, "FORCE_UNIVERSE_REBUILD=on"
+
+    if not p.exists():
+        return True, "saknas"
+
+    if current_rows < min_rows:
+        return True, f"otillräcklig ({current_rows}/{min_rows})"
+
+    age_min = _file_age_minutes(path)
+    if age_min is None:
+        return True, "kan inte läsa filålder"
+
+    # under öppet marknadsläge: tillåt ändå refresh om filen blivit gammal
+    intraday_max_age = _env_int("SCANNER_MAX_AGE_MIN_OPEN", 45)
+    closed_max_age = _env_int("SCANNER_MAX_AGE_MIN_CLOSED", 360)
+
+    if market_open_now():
+        if age_min > intraday_max_age:
+            return True, f"för gammal under öppning ({int(age_min)} min > {intraday_max_age})"
+        return False, f"market open, cache ({int(age_min)} min)"
+
+    # utanför öppning: rebuild om ny dag eller gammal cache
+    if not _built_today(path):
+        return True, "ny dag / gammal cache"
+
+    if age_min > closed_max_age:
+        return True, f"för gammal ({int(age_min)} min > {closed_max_age})"
+
+    return False, f"fil ok ({int(age_min)} min)"
 
 
 def _fallback_tickers() -> list[str]:
@@ -102,6 +156,9 @@ def _is_good_snapshot(stock: dict) -> tuple[bool, str | None]:
         "2x", "3x", "ultra", "ultrapro", "daily",
         "bull", "bear", "short", "leveraged"
     ]
+
+    if symbol in _STALE_OR_DELISTED_SYMBOLS:
+        return False, "stale/delisted symbol"
 
     if price is None:
         return False, "saknar pris"
@@ -152,9 +209,9 @@ def _build_stock_row(
 
 def _screen_filters(limit: int) -> dict:
     filters = {
-        "limit": max(limit * 5, 80),
+        "limit": max(limit * 8, 150),
         "priceMoreThan": PROFILE["min_price"],
-        "volumeMoreThan": 200000,
+        "volumeMoreThan": _env_int("SCANNER_MIN_VOLUME", 200000),
     }
 
     min_market_cap = PROFILE.get("min_market_cap")
@@ -181,11 +238,13 @@ def _get_candidate_symbols(limit: int) -> list[str]:
         seen = set()
         symbols: list[str] = []
 
-        target_candidates = min(max(limit * 8, 120), 300)
+        target_candidates = _env_int("SCANNER_TARGET_CANDIDATES", min(max(limit * 10, 180), 500))
 
         for row in rows:
             sym = (row.get("symbol") or "").upper().strip()
             if not sym or sym in seen:
+                continue
+            if sym in _STALE_OR_DELISTED_SYMBOLS:
                 continue
 
             seen.add(sym)
@@ -231,8 +290,8 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
     rows: list[dict] = []
 
-    target_rows_default = min(max(limit * 5, 80), 150)
-    full_fetch_limit_default = min(max(limit + 60, 120), 150)
+    target_rows_default = min(max(limit * 5, 80), 200)
+    full_fetch_limit_default = min(max(limit + 100, 180), 300)
 
     target_rows = _env_int("SCANNER_TARGET_ROWS", target_rows_default)
     full_fetch_limit = _env_int("SCANNER_FETCH_LIMIT", full_fetch_limit_default)
@@ -254,8 +313,8 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
     for i, sym in enumerate(selected, start=1):
         try:
-            if sym in _BAD_IB_SYMBOLS:
-                log.info("[scanner] SKIP  %3d/%d %-6s | blacklist/ogiltig hos IB", i, len(selected), sym)
+            if sym in _BAD_IB_SYMBOLS or sym in _STALE_OR_DELISTED_SYMBOLS:
+                log.info("[scanner] SKIP  %3d/%d %-6s | blacklist/stale", i, len(selected), sym)
                 continue
 
             quote = quotes.get(sym) or {}
@@ -277,7 +336,12 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
                     "sector": None,
                     "lastDividend": None,
                     "isEtf": None,
+                    "isActivelyTrading": None,
                 }
+
+            if profile.get("isActivelyTrading") is False:
+                log.info("[scanner] SKIP  %3d/%d %-6s | inactive", i, len(selected), sym)
+                continue
 
             if profile.get("isEtf"):
                 log.info("[scanner] SKIP  %3d/%d %-6s | ETF", i, len(selected), sym)
@@ -294,7 +358,7 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
                 fundamentals = {}
 
             try:
-                financials_limit = _env_int("SCANNER_FINANCIALS_LIMIT", 100)
+                financials_limit = _env_int("SCANNER_FINANCIALS_LIMIT", 120)
                 if i <= financials_limit:
                     financials = md.get_financials(sym)
                 else:
@@ -305,7 +369,6 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
             stock = _build_stock_row(sym, quote, profile, fundamentals, financials)
             stock.update(financials)
-
             stock["News"] = []
 
             ok, reason = _is_good_snapshot(stock)
@@ -347,7 +410,7 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
 
 async def ensure_stock_info(ib_client=None, min_count: int = 10) -> list[dict]:
     data = _read_stock_info()
-    minimum_usable = max(10, min(min_count, 30))
+    minimum_usable = max(10, min(min_count, 40))
     current_rows = len(data) if isinstance(data, list) else 0
 
     needs_rebuild, rebuild_reason = should_rebuild_stock_info(
