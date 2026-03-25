@@ -1,4 +1,4 @@
-#autoscan.py
+import asyncio
 import json
 import logging
 import os
@@ -54,7 +54,6 @@ from app.core.autoscan_state import (
     store_owned_snapshot,
 )
 from app.core.helpers import is_dup, kill_switch_ok, market_open_now, market_status_text_sv
-
 from app.core.logview import (
     _BLUE,
     _CYAN,
@@ -68,8 +67,8 @@ from app.core.logview import (
     log_signal_line,
     short_reason_line,
 )
-from app.core.pretrade import validate_pretrade_buy
 from app.core.pipeline import run_pipeline
+from app.core.pretrade import validate_pretrade_buy
 from app.core.signals import execute_order
 from app.core.storage_utils import (
     append_event,
@@ -120,6 +119,73 @@ def trim_jsonl(path: str, keep_last: int = 5000):
     if len(lines) > keep_last:
         with p.open("w", encoding="utf-8") as f:
             f.writelines(lines[-keep_last:])
+
+
+async def _trade_has_fill(trade, wait_sec: float = 8.0, poll_sec: float = 0.25) -> bool:
+    if not trade:
+        return False
+
+    loops = max(1, int(wait_sec / poll_sec))
+
+    for _ in range(loops):
+        try:
+            status = str(trade.orderStatus.status or "").lower()
+        except Exception:
+            status = ""
+
+        try:
+            filled = float(trade.orderStatus.filled or 0)
+        except Exception:
+            filled = 0.0
+
+        if filled > 0:
+            return True
+
+        if status in {"filled"}:
+            return True
+
+        if status in {"cancelled", "inactive", "api cancelled"}:
+            return False
+
+        await asyncio.sleep(poll_sec)
+
+    try:
+        return float(trade.orderStatus.filled or 0) > 0
+    except Exception:
+        return False
+
+
+async def _execute_order_safe(
+    ib_client,
+    raw: dict,
+    side: str,
+    qty: int,
+    bot=None,
+    chat_id=None,
+    quote=None,
+):
+    try:
+        return await execute_order(
+            ib_client,
+            raw,
+            side,
+            qty=qty,
+            bot=bot,
+            chat_id=chat_id,
+            quote=quote,
+        )
+    except TypeError as e:
+        # Bakåtkompatibel fallback om execute_order ännu inte fått quote-parametern
+        if "unexpected keyword argument 'quote'" not in str(e):
+            raise
+        return await execute_order(
+            ib_client,
+            raw,
+            side,
+            qty=qty,
+            bot=bot,
+            chat_id=chat_id,
+        )
 
 
 def _group_symbols(rows: list[dict], held_only: bool = False) -> dict:
@@ -200,11 +266,15 @@ def _apply_symbol_state(
     curr_decision: dict,
     effective_signal: str,
     removed_this_pass: set[str] | None = None,
+    update_signal: bool = True,
 ):
     if removed_this_pass and sym in removed_this_pass:
         return
+
     set_decision_state(state, sym, curr_decision)
-    update_signal_state(state, sym, effective_signal)
+
+    if update_signal:
+        update_signal_state(state, sym, effective_signal)
 
 
 def _build_by_sym(universe: list[dict]) -> dict:
@@ -267,6 +337,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     pass_ex_min = _env_int("PASS_EXCLUDE_MINUTES", _env_int("ASS_EXCLUDE_MINUTES", 20))
     exclude_bought_min = _env_int("EXCLUDE_BOUGHT_MIN", 120)
     drop_if_hold_streak = _env_int("DROP_IF_HOLD_STREAK", 6)
+    min_rotation_pool_size = _env_int("MIN_ROTATION_POOL_SIZE", 3)
     max_order_value = to_float(os.getenv("MAX_ORDER_VALUE_USD", "30"), 30.0)
 
     entries_this_pass = 0
@@ -313,6 +384,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     try:
         await ib_client.ib.reqOpenOrdersAsync()
+
         open_buy_syms = {
             (t.contract.symbol or "").upper()
             for t in ib_client.ib.openTrades()
@@ -323,8 +395,20 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 "pendingsubmit",
             }
         }
+
+        open_sell_syms = {
+            (t.contract.symbol or "").upper()
+            for t in ib_client.ib.openTrades()
+            if (t.order.action or "").upper() == "SELL"
+            and (t.orderStatus.status or "").lower() in {
+                "presubmitted",
+                "submitted",
+                "pendingsubmit",
+            }
+        }
     except Exception:
         open_buy_syms = set()
+        open_sell_syms = set()
 
     state = ensure_state_defaults(load_state())
     today = now_utc().date().isoformat()
@@ -336,8 +420,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     debug_log(log, "[autoscan] FINAL symbols=%s", sorted(list(by_sym.keys())))
 
     risk_ok, risk_reason = kill_switch_ok(
-    getattr(ib_client, "pnl_realized_today", 0.0),
-    getattr(ib_client, "pnl_unrealized_open", 0.0),
+        getattr(ib_client, "pnl_realized_today", 0.0),
+        getattr(ib_client, "pnl_unrealized_open", 0.0),
     )
     market_ok = market_open_now()
     sim_mode = sim_market
@@ -511,8 +595,17 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 },
             )
 
+        persist_signal = effective_signal not in {"Sälj", "Köp"}
+
         if effective_signal not in {"Sälj", "Köp"}:
-            _apply_symbol_state(state, sym, curr_decision, effective_signal)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=True,
+            )
             continue
 
         sells_today_rec = state_counter(state, "sells_today", sym, today)
@@ -520,17 +613,50 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         if effective_signal == "Sälj" and max_sells_per_day > 0 and sells_today_rec["count"] >= max_sells_per_day:
             log.info("[OWNED-SKIP] %s → MAX_SELLS_PER_DAY reached", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         if effective_signal == "Köp" and max_buys_per_day > 0 and buys_today_rec["count"] >= max_buys_per_day:
             log.info("[OWNED-SKIP] %s → MAX_BUYS_PER_DAY reached", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         if is_in_cooldown(state, sym, cooldown_min):
             log.info("[OWNED-SKIP] %s → cooldown", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
+            continue
+
+        if effective_signal == "Sälj" and sym in open_sell_syms:
+            log.info("[OWNED-SKIP] %s → open sell order already exists", sym)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         if exit_mode == "full":
@@ -544,7 +670,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         if qty <= 0:
             log.info("[OWNED-SKIP] %s → no manageable position", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         if effective_signal == "Sälj":
@@ -562,12 +695,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             if is_dup(key):
                 log.info("[OWNED-SKIP] %s → duplicate order key", sym)
-                _apply_symbol_state(state, sym, curr_decision, effective_signal)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
                 continue
 
             trade = None
             try:
-                trade = await execute_order(
+                trade = await _execute_order_safe(
                     ib_client,
                     raw,
                     order_side,
@@ -579,36 +719,43 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 log.error("[OWNED-ORDER-ERR] %s → %s", sym, e)
 
             if trade:
-                if order_side == "Sälj":
-                    orders_sell += 1
-                    increment_day_counter(state, today_bucket, sym, today)
-                    if exit_mode == "soft" and not missing_from_pipeline:
-                        exit_state["soft_exit_done"] = True
-                        set_exit_state(state, sym, exit_state)
+                filled_ok = await _trade_has_fill(trade)
+
+                if filled_ok:
+                    persist_signal = True
+
+                    if order_side == "Sälj":
+                        orders_sell += 1
+                        increment_day_counter(state, today_bucket, sym, today)
+                        if exit_mode == "soft" and not missing_from_pipeline:
+                            exit_state["soft_exit_done"] = True
+                            set_exit_state(state, sym, exit_state)
+                    else:
+                        orders_buy += 1
+                        increment_day_counter(state, today_bucket, sym, today)
+
+                    mark_trade_timestamp(state, sym)
+                    set_exclude_minutes(state, sym, exclude_bought_min)
+
+                    owned_orders_for_report.append(
+                        f"OWNED {report_label} submitted: {sym} x{qty} "
+                        f"(exit_mode={exit_mode}, reason={owned_reason}, stage={exit_state.get('stage')}, source={analysis.get('data_source')})"
+                    )
+
+                    append_event(
+                        event_name,
+                        symbol=sym,
+                        name=raw.get("name") or raw.get("companyName") or sym,
+                        data={
+                            "qty": qty,
+                            "exit_mode": exit_mode,
+                            "exit_reason": owned_reason,
+                            "exit_stage": exit_state.get("stage"),
+                            "data_source": analysis.get("data_source"),
+                        },
+                    )
                 else:
-                    orders_buy += 1
-                    increment_day_counter(state, today_bucket, sym, today)
-
-                mark_trade_timestamp(state, sym)
-                set_exclude_minutes(state, sym, exclude_bought_min)
-
-                owned_orders_for_report.append(
-                    f"OWNED {report_label} submitted: {sym} x{qty} "
-                    f"(exit_mode={exit_mode}, reason={owned_reason}, stage={exit_state.get('stage')}, source={analysis.get('data_source')})"
-                )
-
-                append_event(
-                    event_name,
-                    symbol=sym,
-                    name=raw.get("name") or raw.get("companyName") or sym,
-                    data={
-                        "qty": qty,
-                        "exit_mode": exit_mode,
-                        "exit_reason": owned_reason,
-                        "exit_stage": exit_state.get("stage"),
-                        "data_source": analysis.get("data_source"),
-                    },
-                )
+                    log.info("[OWNED-KEEP] %s → order submitted but not filled yet", sym)
             else:
                 debug_log(log, "[OWNED-KEEP] %s → no real order sent", sym)
 
@@ -637,10 +784,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 analysis.get("data_source"),
             )
 
-            if effective_signal == "Sälj" and exit_mode == "soft" and not missing_from_pipeline:
-                exit_state["soft_exit_done"] = True
-                set_exit_state(state, sym, exit_state)
-
             owned_orders_for_report.append(
                 f"OWNED PAPER-{effective_signal.upper()}: would {effective_signal.lower()} {sym} x{qty} "
                 f"(action={action}, timing={analysis.get('timing_state')}, quality={analysis.get('candidate_quality')}, "
@@ -667,7 +810,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 },
             )
 
-        _apply_symbol_state(state, sym, curr_decision, effective_signal)
+        _apply_symbol_state(
+            state,
+            sym,
+            curr_decision,
+            effective_signal,
+            removed_this_pass,
+            update_signal=persist_signal,
+        )
 
     # =========================
     # SCAN CANDIDATES
@@ -732,14 +882,12 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     all_candidates = dedupe_keep_order(all_candidates)
 
-    # Viktigt: bara toppdelen ska vara scan-seed
     scan_seed = candidate_source[:universe_rows]
 
-    # Viktigt: replacement-pool ska byggas från replacement-eligible kandidater,
-    # inte från hela raw all_candidates
     replacement_source = dedupe_keep_order(
         [s for s in replacement_candidates if s not in scan_seed]
     )
+
     debug_log(
         log,
         "[autoscan] FILTERED candidates | all=%d | entry=%d | tradable_entry=%d | watch=%d | fallback=%d | selected=%d | replacement_candidates=%d",
@@ -801,9 +949,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         tech_price = ((raw.get("_pipeline_technicals") or {}).get("price"))
         shown_price = tech_price if tech_price is not None else raw.get("latestClose")
         analysis = analysis_cache.get(sym) or build_pipeline_analysis(raw)
-        rows_for_log.append(
-            f"{sym} {fmt_price(shown_price)} [{analysis.get('candidate_quality')}]"
-        )
+        rows_for_log.append(f"{sym} {fmt_price(shown_price)} [{analysis.get('candidate_quality')}]")
 
     log.info(
         "%s scan=%d | replacements=%d | mode=%s | market=%s | autotrade=%s",
@@ -811,7 +957,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         len(scan_set),
         replacement_pool_size,
         "SIM" if sim_mode else "LIVE",
-        "OPEN" if market_ok else "CLOSED",
+        "TRADABLE" if market_ok else "CLOSED",
         "ON" if autotrade_enabled else "OFF",
     )
     log.info("%s %s", _c("SCAN SET:", _CYAN, bold=True), ", ".join(rows_for_log))
@@ -897,7 +1043,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     )
                     continue
 
-                # ingen replacement finns -> stoppa symbolen från att fortsätta i denna pass
                 if sym in scan_set:
                     scan_set.remove(sym)
 
@@ -1010,12 +1155,26 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         if sym == "BRK-B" and not raw_technicals.get("price"):
             debug_log(log, "[KEEP] %s → IB technicals still missing, temporarily kept", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         if not raw_technicals:
             debug_log(log, "[KEEP] %s → technicals missing, kept in universe", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         drop_reason = None
@@ -1056,6 +1215,27 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         if drop_reason:
             candidate_scan = [s for s in scan_set if s != sym]
+
+            current_pool_size = len(_available_replacements(candidate_scan, banned=removed_this_pass | {sym}))
+            if current_pool_size < min_rotation_pool_size:
+                debug_log(
+                    log,
+                    "[KEEP] %s → %s but replacement_pool=%d < min=%d",
+                    sym,
+                    drop_reason,
+                    current_pool_size,
+                    min_rotation_pool_size,
+                )
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
             repl = _take_replacement(candidate_scan, banned=removed_this_pass | {sym})
 
             debug_log(
@@ -1072,7 +1252,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             if not repl:
                 debug_log(log, "[KEEP] %s → %s but no replacement is available", sym, drop_reason)
-                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
                 continue
 
             repl_raw = by_sym.get(repl) or {}
@@ -1098,7 +1285,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 watch_streak=effective_hold_streak,
             ):
                 debug_log(log, "[KEEP] %s → replacement %s is not clearly better", sym, repl)
-                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
                 continue
 
             if sym in scan_set:
@@ -1145,8 +1339,26 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             )
             continue
 
+        if effective_signal not in {"Köp", "Sälj"}:
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=True,
+            )
+            continue
+
         if only_trade_on_signal_change and prev_decision.get("signal") == effective_signal:
-            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         buys_today_rec = state_counter(state, "buys_today", sym, today)
@@ -1154,36 +1366,84 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         if effective_signal == "Köp" and max_buys_per_day > 0 and buys_today_rec["count"] >= max_buys_per_day:
             log.info("[SKIP] %s → MAX_BUYS_PER_DAY reached", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         if effective_signal == "Sälj" and max_sells_per_day > 0 and sells_today_rec["count"] >= max_sells_per_day:
             log.info("[SKIP] %s → MAX_SELLS_PER_DAY reached", sym)
-            _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+            _apply_symbol_state(
+                state,
+                sym,
+                curr_decision,
+                effective_signal,
+                removed_this_pass,
+                update_signal=False,
+            )
             continue
 
         current_pos = float(held.get(sym, 0.0))
         qty = auto_qty
         trade = None
+        persist_signal = False
 
         if autotrade_enabled and risk_ok and market_ok and not is_in_cooldown(state, sym, cooldown_min):
             action_signal = effective_signal
 
             if action_signal == "Sälj" and current_pos <= 0:
                 log.info("[SKIP] %s → sell ignored, no position to close", sym)
-                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
+            if action_signal == "Sälj" and sym in open_sell_syms:
+                log.info("[SKIP] %s → open sell order already exists", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
                 continue
 
             if action_signal == "Köp" and entries_this_pass >= max_new_entries_per_pass:
                 log.info("[SKIP] %s → MAX_NEW_ENTRIES_PER_PASS reached", sym)
-                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
                 continue
 
             if action_signal == "Köp" and max_pos_per_symbol > 0:
                 remaining_cap = max(0, max_pos_per_symbol - int(current_pos))
                 if remaining_cap <= 0:
                     log.info("[SKIP] %s → MAX_POS_PER_SYMBOL reached", sym)
-                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                    _apply_symbol_state(
+                        state,
+                        sym,
+                        curr_decision,
+                        effective_signal,
+                        removed_this_pass,
+                        update_signal=False,
+                    )
                     continue
                 qty = min(auto_qty, remaining_cap)
 
@@ -1191,7 +1451,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 qty = min(auto_qty, int(current_pos))
                 if qty <= 0:
                     log.info("[SKIP] %s → no sellable position", sym)
-                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                    _apply_symbol_state(
+                        state,
+                        sym,
+                        curr_decision,
+                        effective_signal,
+                        removed_this_pass,
+                        update_signal=False,
+                    )
                     continue
 
             pretrade = None
@@ -1207,11 +1474,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 )
 
                 if not pretrade.get("ok"):
-                    log.info(
-                        "[SKIP] %s → pretrade blocked | %s",
-                        sym,
-                        pretrade.get("reason"),
-                    )
+                    log.info("[SKIP] %s → pretrade blocked | %s", sym, pretrade.get("reason"))
 
                     append_event(
                         "buy_blocked_pretrade",
@@ -1226,7 +1489,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                         },
                     )
 
-                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                    _apply_symbol_state(
+                        state,
+                        sym,
+                        curr_decision,
+                        effective_signal,
+                        removed_this_pass,
+                        update_signal=False,
+                    )
                     continue
 
             price_now = (
@@ -1234,30 +1504,55 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 or to_float(raw_technicals.get("price"), 0)
                 or to_float(raw.get("latestClose"), 0)
             )
+
             if action_signal == "Köp" and price_now > 0:
                 est_value = price_now * qty
                 if est_value > max_order_value:
                     log.info("[SKIP] %s → order value %.2f exceeds max %.2f", sym, est_value, max_order_value)
-                    _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+                    _apply_symbol_state(
+                        state,
+                        sym,
+                        curr_decision,
+                        effective_signal,
+                        removed_this_pass,
+                        update_signal=False,
+                    )
                     continue
 
             key = f"{sym}:{action_signal}:{int(qty)}"
 
-            if not is_dup(key):
-                try:
-                    trade = await execute_order(
-                        ib_client,
-                        raw,
-                        action_signal,
-                        qty=qty,
-                        bot=bot,
-                        chat_id=admin_chat_id,
-                    )
-                except Exception as e:
-                    trade = None
-                    log.error("[ORDER-ERR] %s → %s", sym, e)
+            if is_dup(key):
+                log.info("[SKIP] %s → duplicate order key", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
 
-                if trade:
+            try:
+                trade = await _execute_order_safe(
+                    ib_client,
+                    raw,
+                    action_signal,
+                    qty=qty,
+                    bot=bot,
+                    chat_id=admin_chat_id,
+                    quote=(pretrade or {}).get("quote"),
+                )
+            except Exception as e:
+                trade = None
+                log.error("[ORDER-ERR] %s → %s", sym, e)
+
+            if trade:
+                filled_ok = await _trade_has_fill(trade)
+
+                if filled_ok:
+                    persist_signal = True
+
                     if action_signal == "Köp":
                         entries_this_pass += 1
                         orders_buy += 1
@@ -1333,11 +1628,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                             reason=f"replaced {sym}",
                         )
                 else:
-                    debug_log(log, "[KEEP] %s → no real order, kept in universe", sym)
+                    log.info("[KEEP] %s → order submitted but not filled yet, no counters/exclude/rotation", sym)
             else:
-                log.info("[SKIP] %s → duplicate order key", sym)
-                _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
-                continue
+                debug_log(log, "[KEEP] %s → no real order, kept in universe", sym)
 
         else:
             why = []
@@ -1404,7 +1697,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         if sym in removed_this_pass:
             continue
 
-        _apply_symbol_state(state, sym, curr_decision, effective_signal, removed_this_pass)
+        _apply_symbol_state(
+            state,
+            sym,
+            curr_decision,
+            effective_signal,
+            removed_this_pass,
+            update_signal=persist_signal,
+        )
 
     scan_set = _fill_scan_set(scan_set, banned=removed_this_pass)
 

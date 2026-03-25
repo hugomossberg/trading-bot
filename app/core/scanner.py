@@ -1,3 +1,4 @@
+#scanner.py
 import json
 import logging
 import os
@@ -413,7 +414,8 @@ async def ensure_stock_info(ib_client=None, min_count: int = 10) -> list[dict]:
     - fallback-build bara om fil saknas/är trasig/för liten
     """
     data = _read_stock_info()
-    minimum_usable = max(10, min(min_count, 40))
+    minimum_usable = _env_int("SCANNER_MIN_USABLE_ROWS", 80)
+    minimum_usable = max(10, minimum_usable)
     current_rows = len(data) if isinstance(data, list) else 0
 
     needs_rebuild, rebuild_reason = should_rebuild_stock_info(

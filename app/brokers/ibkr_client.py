@@ -1,7 +1,10 @@
-#ibkr_client.py
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, ScannerSubscription
 import asyncio
+import math
 import os
+
+from app.config import TWS_PORT
+from app.core.helpers import order_outside_rth_allowed
 
 
 # ===== Terminalstil =====
@@ -26,21 +29,27 @@ def _c(text, color):
 def _side_color(side: str):
     return _GREEN if str(side).upper() == "BUY" else _RED
 
+
 def _to_num(value):
     try:
         value = float(value)
-        if value <= 0:
-            return None
-        return value
     except Exception:
         return None
 
+    if not math.isfinite(value):
+        return None
+
+    if value <= 0:
+        return None
+
+    return value
+
 
 def _fmt_price(value):
-    try:
-        return f"{float(value):.2f}"
-    except Exception:
+    v = _to_num(value)
+    if v is None:
         return "-"
+    return f"{v:.2f}"
 
 
 def _fmt_qty(value):
@@ -50,18 +59,15 @@ def _fmt_qty(value):
         return str(value)
 
 
-
-
 class IbClient:
     def __init__(self):
         self.ib = IB()
 
-    # Port 4002 för paper, 4001 för live
     async def connect(self):
         if not self.ib.isConnected():
             try:
-                await self.ib.connectAsync("127.0.0.1", 4002, clientId=1, timeout=30)
-                print(f"{_c('● CONNECT', _CYAN)} {_c('API connected on 4002', _BOLD)}")
+                await self.ib.connectAsync("127.0.0.1", TWS_PORT, clientId=1, timeout=30)
+                print(f"{_c('● CONNECT', _CYAN)} {_c(f'API connected on {TWS_PORT}', _BOLD)}")
             except Exception as e:
                 print(f"{_c('● CONNECT ERROR', _RED)} {e}")
         else:
@@ -69,37 +75,61 @@ class IbClient:
 
     async def _get_reference_price(self, contract):
         price = None
+        ticker = None
 
         try:
+            try:
+                self.ib.reqMarketDataType(1)  # live
+            except Exception:
+                pass
+
             ticker = self.ib.reqMktData(contract, "", False, False)
             await asyncio.sleep(1.5)
 
             price = (
-                ticker.last
-                or ticker.marketPrice()
-                or ticker.close
-                or ticker.bid
-                or ticker.ask
+                _to_num(ticker.last)
+                or _to_num(ticker.marketPrice())
+                or _to_num(ticker.close)
+                or _to_num(ticker.bid)
+                or _to_num(ticker.ask)
             )
-        except Exception:
-            price = None
-        finally:
+
+            if price is not None:
+                return price
+
             try:
-                self.ib.cancelMktData(contract)
+                if ticker is not None:
+                    self.ib.cancelMktData(contract)
             except Exception:
                 pass
 
-        try:
-            if price is not None:
-                price = float(price)
-                if price > 0:
-                    return price
+            try:
+                self.ib.reqMarketDataType(3)  # delayed
+            except Exception:
+                pass
+
+            ticker = self.ib.reqMktData(contract, "", False, False)
+            await asyncio.sleep(1.5)
+
+            price = (
+                _to_num(ticker.last)
+                or _to_num(ticker.marketPrice())
+                or _to_num(ticker.close)
+                or _to_num(ticker.bid)
+                or _to_num(ticker.ask)
+            )
+
+            return price
+
         except Exception:
-            pass
+            return None
+        finally:
+            try:
+                if ticker is not None:
+                    self.ib.cancelMktData(contract)
+            except Exception:
+                pass
 
-        return None
-
-    
     async def get_live_quote(self, symbol: str, wait_sec: float = 1.2):
         contract = Stock(symbol, "SMART", "USD")
 
@@ -111,55 +141,68 @@ class IbClient:
         except Exception:
             return None
 
-        ticker = None
-        try:
-            # 1 = live om tillgängligt
+        async def _read_quote(market_data_type: int):
+            ticker = None
             try:
-                self.ib.reqMarketDataType(1)
+                try:
+                    self.ib.reqMarketDataType(market_data_type)
+                except Exception:
+                    pass
+
+                ticker = self.ib.reqMktData(contract, "", False, False)
+                await asyncio.sleep(wait_sec)
+
+                bid = _to_num(ticker.bid)
+                ask = _to_num(ticker.ask)
+                last = _to_num(ticker.last)
+                market = _to_num(ticker.marketPrice())
+                close = _to_num(ticker.close)
+
+                mid = None
+                spread = None
+                spread_pct = None
+
+                if bid is not None and ask is not None and ask >= bid:
+                    mid = round((bid + ask) / 2, 4)
+                    spread = round(ask - bid, 4)
+                    if mid > 0:
+                        spread_pct = round((spread / mid) * 100.0, 4)
+
+                if any(v is not None for v in [bid, ask, last, market, close, mid]):
+                    return {
+                        "symbol": symbol,
+                        "bid": bid,
+                        "ask": ask,
+                        "last": last,
+                        "market": market,
+                        "close": close,
+                        "mid": mid,
+                        "spread": spread,
+                        "spread_pct": spread_pct,
+                    }
+
+                return None
+
             except Exception:
-                pass
+                return None
+            finally:
+                try:
+                    if ticker is not None:
+                        self.ib.cancelMktData(contract)
+                except Exception:
+                    pass
 
-            ticker = self.ib.reqMktData(contract, "", False, False)
-            await asyncio.sleep(wait_sec)
+        quote = await _read_quote(1)  # live
+        if quote:
+            return quote
 
-            bid = _to_num(ticker.bid)
-            ask = _to_num(ticker.ask)
-            last = _to_num(ticker.last)
-            market = _to_num(ticker.marketPrice())
-            close = _to_num(ticker.close)
+        quote = await _read_quote(3)  # delayed
+        if quote:
+            return quote
 
-            mid = None
-            spread = None
-            spread_pct = None
+        return None
 
-            if bid is not None and ask is not None and ask >= bid:
-                mid = round((bid + ask) / 2, 4)
-                spread = round(ask - bid, 4)
-                if mid and mid > 0:
-                    spread_pct = round((spread / mid) * 100.0, 4)
-
-            return {
-                "symbol": symbol,
-                "bid": bid,
-                "ask": ask,
-                "last": last,
-                "market": market,
-                "close": close,
-                "mid": mid,
-                "spread": spread,
-                "spread_pct": spread_pct,
-            }
-
-        except Exception:
-            return None
-        finally:
-            try:
-                if ticker is not None:
-                    self.ib.cancelMktData(contract)
-            except Exception:
-                pass
-
-    async def place_order(self, symbol, side, qty, bot=None, chat_id=None):
+    async def place_order(self, symbol, side, qty, bot=None, chat_id=None, quote=None):
         contract = Stock(symbol, "SMART", "USD")
         side_up = side.upper()
         side_col = _side_color(side_up)
@@ -174,7 +217,7 @@ class IbClient:
             print(f"{_c('● ORDER ERROR', _RED)} qualifyContracts failed for {_c(symbol, _BOLD)}: {e}")
             return None
 
-        quote = await self.get_live_quote(symbol)
+        quote = quote or await self.get_live_quote(symbol)
         ref_price = None
 
         if quote:
@@ -195,11 +238,23 @@ class IbClient:
                     or quote.get("close")
                 )
 
+        ref_price = _to_num(ref_price)
+
         use_limit_orders = os.getenv("USE_LIMIT_ORDERS", "1").strip().lower() in {
             "1", "true", "yes", "on"
         }
 
-        if use_limit_orders and ref_price:
+        if order_outside_rth_allowed():
+            use_limit_orders = True
+
+        if use_limit_orders:
+            if ref_price is None:
+                print(
+                    f"{_c('● ORDER SKIP', _YELLOW)} "
+                    f"{_c(symbol, _BOLD)} no valid quote/reference price for limit order"
+                )
+                return None
+
             buy_buffer = float(os.getenv("BUY_LIMIT_BUFFER_PCT", "0.002"))
             sell_buffer = float(os.getenv("SELL_LIMIT_BUFFER_PCT", "0.002"))
 
@@ -207,6 +262,14 @@ class IbClient:
                 limit_price = round(ref_price * (1 + buy_buffer), 2)
             else:
                 limit_price = round(ref_price * (1 - sell_buffer), 2)
+
+            limit_price = _to_num(limit_price)
+            if limit_price is None:
+                print(
+                    f"{_c('● ORDER SKIP', _YELLOW)} "
+                    f"{_c(symbol, _BOLD)} invalid limit price"
+                )
+                return None
 
             order = LimitOrder(side_up, qty, limit_price)
 
@@ -235,14 +298,12 @@ class IbClient:
                 f"type={_c('MARKET', _MAGENTA)}"
             )
             print(_c("═" * 72, side_col))
-        allow_ext_hours = os.getenv("ALLOW_EXTENDED_HOURS", "0").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
 
+        allow_outside_rth = order_outside_rth_allowed()
         order_tif = os.getenv("ORDER_TIF", "DAY").strip().upper() or "DAY"
 
         try:
-            order.outsideRth = allow_ext_hours
+            order.outsideRth = allow_outside_rth
         except Exception:
             pass
 
@@ -252,8 +313,6 @@ class IbClient:
             pass
 
         trade = self.ib.placeOrder(contract, order)
-
-        
 
         def on_status(trade_):
             status = trade_.orderStatus.status
@@ -388,5 +447,4 @@ class IbClient:
         print(f"{_c('● DISCONNECT', _YELLOW)} API disconnected")
 
 
-# Global instans att återanvända
 ib_client = IbClient()

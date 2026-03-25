@@ -2,6 +2,16 @@
 import os
 from pathlib import Path
 
+from pathlib import Path
+import os
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+load_dotenv(dotenv_path=BASE_DIR / ".env")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip().replace("\ufeff", "")
+TWS_PORT = int(os.getenv("TWS_PORT", "4002"))
+
 
 def env_bool(key: str, default: bool = False) -> bool:
     value = os.getenv(key, "").strip().lower()

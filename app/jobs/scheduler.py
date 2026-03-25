@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import time
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from telegram.ext import Application
 
@@ -17,6 +17,17 @@ def _env_int(key, default):
         return int(os.getenv(key, str(default)))
     except Exception:
         return default
+
+
+def premarket_schedule_text_sv(hour_et: int = 9, minute_et: int = 10) -> str:
+    now_us = datetime.now(US_TZ)
+    sched_us = now_us.replace(hour=hour_et, minute=minute_et, second=0, microsecond=0)
+    sched_se = sched_us.astimezone(SE_TZ)
+
+    return (
+        f"Premarket schemalagd {sched_us:%H:%M} ET / "
+        f"{sched_se:%H:%M} svensk tid (mån-fre)."
+    )
 
 
 def setup_jobs(app: Application, ib_client):
@@ -63,4 +74,4 @@ def setup_jobs(app: Application, ib_client):
         },
     )
 
-    log.info("Premarket scheduled %02d:%02d ET (Mon-Fri).", hh, mm)
+    log.info("%s", premarket_schedule_text_sv(hh, mm))

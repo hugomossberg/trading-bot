@@ -110,33 +110,28 @@ def get_market_session_info(now_local: datetime | None = None) -> dict:
     weekday = now_market.weekday()  # Mon=0 ... Sun=6
     hhmm = now_market.hour * 60 + now_market.minute
 
-    regular_start = PROFILE["open_hour"] * 60 + PROFILE["open_minute"]   # ex 09:30
-    regular_end = PROFILE["close_hour"] * 60 + PROFILE["close_minute"]   # ex 16:00
+    regular_start = PROFILE["open_hour"] * 60 + PROFILE["open_minute"]
+    regular_end = PROFILE["close_hour"] * 60 + PROFILE["close_minute"]
 
-    premarket_start = 4 * 60          # 04:00 ET
-    afterhours_end = 20 * 60          # 20:00 ET
-    overnight_end = 3 * 60 + 50       # 03:50 ET
+    premarket_start = 4 * 60
+    afterhours_end = 20 * 60
+    overnight_end = 3 * 60 + 50
 
     phase = "closed"
     market_open = False
 
-    # 1) Regular market, måndag-fredag
     if weekday < 5 and regular_start <= hhmm <= regular_end:
         phase = "regular"
         market_open = True
 
-    # 2) Premarket, måndag-fredag
     elif allow_extended and weekday < 5 and premarket_start <= hhmm < regular_start:
         phase = "premarket"
         market_open = True
 
-    # 3) After hours, måndag-fredag
     elif allow_extended and weekday < 5 and regular_end < hhmm <= afterhours_end:
         phase = "afterhours"
         market_open = True
 
-    # 4) Overnight session (separat från vanlig outsideRTH)
-    #    Gäller söndag kväll -> fredag morgon
     elif allow_overnight:
         evening_session = weekday in {6, 0, 1, 2, 3} and hhmm >= afterhours_end
         morning_session = weekday in {0, 1, 2, 3, 4} and hhmm <= overnight_end
@@ -158,6 +153,11 @@ def get_market_session_info(now_local: datetime | None = None) -> dict:
 
 def market_open_now(now_local: datetime | None = None) -> bool:
     return bool(get_market_session_info(now_local)["market_open"])
+
+
+def order_outside_rth_allowed(now_local: datetime | None = None) -> bool:
+    info = get_market_session_info(now_local)
+    return info["phase"] in {"premarket", "afterhours", "overnight", "sim"}
 
 
 def market_status_text_sv(now_local: datetime | None = None) -> str:

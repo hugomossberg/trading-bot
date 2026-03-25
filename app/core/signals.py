@@ -25,7 +25,7 @@ def signal_to_side(signal):
     return mapping.get(signal)
 
 
-async def execute_order(ib_client, stock, signal, qty=10, bot=None, chat_id=None):
+async def execute_order(ib_client, stock, signal, qty=10, bot=None, chat_id=None, quote=None):
     side = signal_to_side(signal)
     if side is None:
         return None
@@ -46,5 +46,6 @@ async def execute_order(ib_client, stock, signal, qty=10, bot=None, chat_id=None
         int(qty),
         bot=bot,
         chat_id=chat_id,
+        quote=quote,
     )
     return trade

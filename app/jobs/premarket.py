@@ -76,23 +76,27 @@ async def run_premarket_scan(bot, ib_client, admin_chat_id: int, want_ai: bool =
     3) Premarket-rapport på ägda innehav
     """
 
-    # Bygg ALLTID dagens stock_info först
     try:
         built = await rebuild_stock_info_for_premarket(ib_client=ib_client, limit=50)
-        if admin_chat_id:
+        if bot and admin_chat_id:
             await bot.send_message(
                 admin_chat_id,
                 f"Premarket: stock_info rebuild klar ({len(built)} rows)."
             )
     except Exception as e:
         log.exception("Premarket rebuild fail")
-        if admin_chat_id:
-            await bot.send_message(admin_chat_id, f"Premarket: stock_info rebuild misslyckades ({e}).")
+        if bot and admin_chat_id:
+            await bot.send_message(
+                admin_chat_id,
+                f"Premarket: stock_info rebuild misslyckades ({e})."
+            )
 
-    # Om IB saknas, stanna här efter rebuild
     if not ib_client or not ib_client.ib.isConnected():
-        if admin_chat_id:
-            await bot.send_message(admin_chat_id, "Premarket: IBKR inte ansluten – hoppar innehavsanalys.")
+        if bot and admin_chat_id:
+            await bot.send_message(
+                admin_chat_id,
+                "Premarket: IBKR inte ansluten – hoppar innehavsanalys."
+            )
         return
 
     positions = await ib_client.ib.reqPositionsAsync()
@@ -104,7 +108,7 @@ async def run_premarket_scan(bot, ib_client, admin_chat_id: int, want_ai: bool =
             held[sym] = held.get(sym, 0.0) + qty
 
     if not held:
-        if admin_chat_id:
+        if bot and admin_chat_id:
             await bot.send_message(admin_chat_id, "Premarket: Inga aktier ägs just nu.")
         return
 
@@ -162,10 +166,11 @@ async def run_premarket_scan(bot, ib_client, admin_chat_id: int, want_ai: bool =
         f"Analyserar ägda tickers + senaste rubriker • markerar Köp/Håll/Sälj\n"
     )
 
-    await send_long_message(bot, admin_chat_id, f"{header}\n" + "\n".join(rows))
+    if bot and admin_chat_id:
+        await send_long_message(bot, admin_chat_id, f"{header}\n" + "\n".join(rows))
 
-    if ai_blocks:
-        await send_long_message(bot, admin_chat_id, "\n\n".join(ai_blocks))
+        if ai_blocks:
+            await send_long_message(bot, admin_chat_id, "\n\n".join(ai_blocks))
 
     try:
         Path("storage/reports").mkdir(parents=True, exist_ok=True)
