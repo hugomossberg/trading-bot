@@ -84,7 +84,7 @@ def _run_stage1(universe: list[dict]) -> list[dict]:
         if not symbol:
             continue
 
-        technicals = build_technical_snapshot(symbol) or {}
+        technicals = build_technical_snapshot(symbol, use_ib=False) or {}
         filters = precheck_stock(stock, technicals)
 
         score, score_details = _stage1_score(stock, technicals)
@@ -401,3 +401,5 @@ async def run_pipeline(ib_client) -> dict:
     )
 
     return snapshot
+
+    

@@ -150,7 +150,7 @@ def _bars_to_df(bars):
     return df.reset_index(drop=True)
 
 
-def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
+def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d", use_ib: bool = True):
     """
     Hämtar historiska candles via IB.
     Returnerar pandas DataFrame eller None.
@@ -165,6 +165,12 @@ def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d"):
         ts, df = cached
         if now - ts < _HISTORY_TTL_SEC:
             return df
+
+
+    if not use_ib:
+        _HISTORY_CACHE[cache_key] = (now, None)
+        return None
+
 
     if _should_skip_ib_symbol(sym):
         _HISTORY_CACHE[cache_key] = (now, None)
@@ -371,7 +377,7 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
     return t
 
 
-def build_technical_snapshot(symbol: str):
+def build_technical_snapshot(symbol: str, use_ib: bool = True):
     """
     Returnerar technicals-dict för symbolen.
     Returnerar alltid en dict, aldrig {}.
@@ -380,7 +386,7 @@ def build_technical_snapshot(symbol: str):
     if not sym:
         return _empty_snapshot()
 
-    df = fetch_price_history(sym, period="6mo", interval="1d")
+    df = fetch_price_history(sym, period="6mo", interval="1d", use_ib=use_ib)
     if df is None or df.empty:
         snapshot = _empty_snapshot()
         if _sim_enabled():
