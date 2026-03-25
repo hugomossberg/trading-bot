@@ -18,6 +18,7 @@ def resolve_owned_input(sym: str, by_sym: dict, state: dict) -> dict:
         analysis = build_pipeline_analysis(current)
         analysis["data_source"] = "current_scan"
         analysis["missing_from_pipeline"] = False
+        analysis["missing_from_pipeline_count"] = 0
         analysis["stale_snapshot"] = False
         return analysis
 
@@ -36,6 +37,7 @@ def resolve_owned_input(sym: str, by_sym: dict, state: dict) -> dict:
             "entry_reasons": previous.get("entry_reasons") or [],
             "data_source": "owned_snapshot",
             "missing_from_pipeline": True,
+            "missing_from_pipeline_count": int(previous.get("missing_from_pipeline_count", 0) or 0) + 1,
             "stale_snapshot": True,
         }
         return analysis
@@ -54,6 +56,7 @@ def resolve_owned_input(sym: str, by_sym: dict, state: dict) -> dict:
         "entry_reasons": [],
         "data_source": "minimal_fallback",
         "missing_from_pipeline": True,
+        "missing_from_pipeline_count": 999,
         "stale_snapshot": True,
     }
 
@@ -67,6 +70,7 @@ def classify_exit_pressure(analysis: dict, current_pos: float) -> str:
     q_rank = quality_rank(analysis.get("candidate_quality"))
     score = to_int(analysis.get("total_score"), 0)
     retention = to_int(analysis.get("retention_score"), score)
+    missing_count = to_int(analysis.get("missing_from_pipeline_count"), 0)
 
     if action == "exit_ready":
         return "emergency"
@@ -81,6 +85,8 @@ def classify_exit_pressure(analysis: dict, current_pos: float) -> str:
     if timing_state == "avoid" and (q_rank <= 2 or retention <= 3):
         return "bearish"
     if action in {"watch"} and retention <= 3:
+        return "weak"
+    if analysis.get("missing_from_pipeline") and missing_count >= 3:
         return "weak"
 
     return "healthy"
@@ -201,9 +207,9 @@ def build_owned_review_row(
         "owned_label": owned_label,
         "data_source": analysis.get("data_source", "unknown"),
         "missing_from_pipeline": bool(analysis.get("missing_from_pipeline")),
+        "missing_from_pipeline_count": analysis.get("missing_from_pipeline_count", 0),
         "updated_at": now_utc().isoformat(),
     }
-
 
 def build_owned_decision_state(
     *,

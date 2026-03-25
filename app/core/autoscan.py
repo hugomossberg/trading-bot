@@ -46,13 +46,20 @@ from app.core.autoscan_shared import (
 )
 from app.core.autoscan_state import (
     ensure_state_defaults,
+    has_recent_order_key,
     increment_day_counter,
     is_excluded,
+    is_global_trade_cooldown,
     is_in_cooldown,
+    mark_global_trade_timestamp,
     mark_trade_timestamp,
+    note_scan_pass,
+    remember_order_key,
+    scan_pass_count,
     set_exclude_minutes,
     state_counter,
     store_owned_snapshot,
+    total_bucket_count,
 )
 
 from app.core.helpers import (
@@ -366,9 +373,15 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     only_trade_on_signal_change = _env_bool("ONLY_TRADE_ON_SIGNAL_CHANGE", True)
     cooldown_min = _env_int("COOLDOWN_MIN", 30)
     max_pos_per_symbol = _env_int("MAX_POS_PER_SYMBOL", 0)
+
     max_buys_per_day = _env_int("MAX_BUYS_PER_DAY", 1)
     max_new_entries_per_pass = _env_int("MAX_NEW_ENTRIES_PER_PASS", 2)
     max_sells_per_day = _env_int("MAX_SELLS_PER_DAY", 2)
+    max_total_open_positions = _env_int("MAX_TOTAL_OPEN_POSITIONS", 6)
+    max_new_entries_per_day_total = _env_int("MAX_NEW_ENTRIES_PER_DAY_TOTAL", 6)
+    min_minutes_between_global_buys = _env_int("MIN_MINUTES_BETWEEN_GLOBAL_BUYS", 2)
+    min_scan_passes_before_buy = _env_int("MIN_SCAN_PASSES_BEFORE_BUY", 2)
+    persist_order_key_ttl_sec = _env_int("PERSIST_ORDER_KEY_TTL_SEC", 600)
     pass_ex_min = _env_int("PASS_EXCLUDE_MINUTES", _env_int("ASS_EXCLUDE_MINUTES", 20))
     exclude_bought_min = _env_int("EXCLUDE_BOUGHT_MIN", 120)
     drop_if_hold_streak = _env_int("DROP_IF_HOLD_STREAK", 6)
@@ -471,6 +484,62 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     removed = []
     removed_this_pass = set()
 
+    def _long_position_count() -> int:
+        held_long = {sym for sym, pos in held.items() if float(pos or 0.0) > 0}
+        return len(held_long | set(open_buy_syms))
+
+
+    def _upsert_portfolio_review(row: dict):
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            return
+
+        for idx, existing in enumerate(portfolio_reviews):
+            if str(existing.get("symbol") or "").upper().strip() == symbol:
+                portfolio_reviews[idx] = row
+                return
+
+        portfolio_reviews.append(row)
+
+
+    def _remove_portfolio_review(sym: str):
+        sym = str(sym).upper().strip()
+        portfolio_reviews[:] = [
+            row for row in portfolio_reviews
+            if str(row.get("symbol") or "").upper().strip() != sym
+        ]
+
+
+    def _sync_local_fill_state(sym: str, side: str, qty: int):
+        sym = str(sym).upper().strip()
+        side = str(side).strip()
+        qty = int(qty or 0)
+        if not sym or qty <= 0:
+            return 0.0
+
+        current = float(held.get(sym, 0.0) or 0.0)
+
+        if side == "Köp":
+            current += qty
+            if abs(current) < 1e-9:
+                held.pop(sym, None)
+                current = 0.0
+            else:
+                held[sym] = current
+            open_buy_syms.discard(sym)
+            mark_global_trade_timestamp(state, "buy")
+        else:
+            current -= qty
+            if current <= 0:
+                held.pop(sym, None)
+                current = 0.0
+            else:
+                held[sym] = current
+            open_sell_syms.discard(sym)
+            mark_global_trade_timestamp(state, "sell")
+
+        return current
+
     orders_buy = 0
     orders_sell = 0
     paper_buy = 0
@@ -493,7 +562,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     owned_sell_soon = 0
     owned_checked = 0
 
-    for sym, current_pos in held.items():
+    for sym, current_pos in list(held.items()):
         if float(current_pos or 0.0) == 0:
             continue
 
@@ -700,11 +769,20 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         if exit_mode == "full":
             qty = int(abs(current_pos))
         elif exit_mode == "soft":
+            if abs(current_pos) < 2:
+                log.info("[OWNED-SKIP] %s → soft exit skipped, position too small", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
             qty = max(1, int(abs(current_pos) / 2))
         elif exit_mode == "cover":
             qty = int(abs(current_pos))
-        else:
-            qty = min(auto_qty, int(abs(current_pos)))
 
         if qty <= 0:
             log.info("[OWNED-SKIP] %s → no manageable position", sym)
@@ -731,7 +809,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             order_side = effective_signal
             key = f"{sym}:OWNED_{order_side}:{int(qty)}"
 
-            if is_dup(key):
+            if is_dup(key) or has_recent_order_key(state, key, persist_order_key_ttl_sec):
                 log.info("[OWNED-SKIP] %s → duplicate order key", sym)
                 _apply_symbol_state(
                     state,
@@ -757,6 +835,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 log.error("[OWNED-ORDER-ERR] %s → %s", sym, e)
 
             if trade:
+                remember_order_key(state, key)
                 filled_ok = await _trade_has_fill(trade)
 
                 if filled_ok:
@@ -774,6 +853,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
                     mark_trade_timestamp(state, sym)
                     set_exclude_minutes(state, sym, exclude_bought_min)
+                    new_pos = _sync_local_fill_state(sym, order_side, qty)
+
+                    if order_side == "Sälj" and new_pos <= 0:
+                        _remove_portfolio_review(sym)
 
                     owned_orders_for_report.append(
                         f"OWNED {report_label} submitted: {sym} x{qty} "
@@ -1006,6 +1089,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         len(added_pre),
     )
 
+    for sym in dropped_pre:
+        if sym not in removed:
+            removed.append(sym)
+
+    for sym in added_pre:
+        if sym not in added:
+            added.append(sym)
+
     def _available_replacements(current_scan, banned=None):
         pool, reason_counts = available_replacements(
             current_scan=current_scan,
@@ -1037,7 +1128,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         return dedupe_keep_order(current_scan)[:universe_rows]
 
     scan_set = _fill_scan_set(scan_set, banned=removed_this_pass)
+    note_scan_pass(state, scan_set)
     state["universe"] = list(scan_set)
+
     replacement_pool_size = len(_available_replacements(scan_set, banned=removed_this_pass))
 
     if dropped_pre:
@@ -1533,6 +1626,54 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     update_signal=False,
                 )
                 continue
+            #
+            if action_signal == "Köp" and current_pos <= 0 and max_total_open_positions > 0 and _long_position_count() >= max_total_open_positions:
+                log.info("[SKIP] %s → MAX_TOTAL_OPEN_POSITIONS reached", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
+            if action_signal == "Köp" and total_bucket_count(state, "buys_today", today) >= max_new_entries_per_day_total:
+                log.info("[SKIP] %s → MAX_NEW_ENTRIES_PER_DAY_TOTAL reached", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
+            if action_signal == "Köp" and is_global_trade_cooldown(state, "buy", min_minutes_between_global_buys):
+                log.info("[SKIP] %s → global buy cooldown active", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
+            if action_signal == "Köp" and scan_pass_count(state, sym) < min_scan_passes_before_buy:
+                log.info("[SKIP] %s → waiting for scan maturity (%d/%d)", sym, scan_pass_count(state, sym), min_scan_passes_before_buy)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
 
             if action_signal == "Köp" and max_pos_per_symbol > 0:
                 remaining_cap = max(0, max_pos_per_symbol - int(current_pos))
@@ -1623,7 +1764,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             key = f"{sym}:{action_signal}:{int(qty)}"
 
-            if is_dup(key):
+            if is_dup(key) or has_recent_order_key(state, key, persist_order_key_ttl_sec):
                 log.info("[SKIP] %s → duplicate order key", sym)
                 _apply_symbol_state(
                     state,
@@ -1650,6 +1791,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 log.error("[ORDER-ERR] %s → %s", sym, e)
 
             if trade:
+                remember_order_key(state, key)
                 filled_ok = await _trade_has_fill(trade)
 
                 if filled_ok:
@@ -1684,8 +1826,25 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                             data={"qty": qty},
                         )
 
-                    set_exclude_minutes(state, sym, exclude_bought_min)
                     mark_trade_timestamp(state, sym)
+                    set_exclude_minutes(state, sym, exclude_bought_min)
+                    new_pos = _sync_local_fill_state(sym, action_signal, qty)
+
+                    if action_signal == "Köp":
+                        new_owned_row = build_owned_review_row(
+                            sym=sym,
+                            raw=raw,
+                            analysis=analysis,
+                            current_pos=new_pos,
+                            effective_signal="Håll",
+                            exit_mode="hold",
+                            owned_reason="new_buy_fill",
+                            exit_state={"stage": 0},
+                        )
+                        store_owned_snapshot(state, new_owned_row)
+                        _upsert_portfolio_review(new_owned_row)
+                    elif action_signal == "Sälj" and new_pos <= 0:
+                        _remove_portfolio_review(sym)
 
                     if sym in scan_set:
                         scan_set.remove(sym)
