@@ -17,7 +17,7 @@ from app.config import TELEGRAM_TOKEN, ADMIN_CHAT_ID, LOG_LEVEL, TWS_PORT
 
 load_dotenv()
 nest_asyncio.apply()
-set_ib_client(ib_client)
+
 
 # --- Logging: tydligt för aktier, dämpa httpx/telegram-spam ---
 root_level = LOG_LEVEL
@@ -73,6 +73,7 @@ async def nyheter_cmd(update, context):
 async def main():
     # 1) IBKR
     await ib_client.connect()
+    set_ib_client(ib_client)
     log.info("API Connected on %s!", TWS_PORT)
 
     # 2) Telegram-app (med timeouts)
@@ -101,10 +102,17 @@ async def main():
     log.info("API Connected on %s!", TWS_PORT)
 
     # 4) Kör boten
-    await app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
 
-    # 5) Städning
-    await ib_client.disconnect_ibkr()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await ib_client.disconnect_ibkr()
 
 
 if __name__ == "__main__":

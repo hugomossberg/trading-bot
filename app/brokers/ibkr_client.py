@@ -1,3 +1,4 @@
+#ibkr_client.py
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, ScannerSubscription
 import asyncio
 import math
@@ -5,6 +6,7 @@ import os
 
 from app.config import TWS_PORT
 from app.core.helpers import order_outside_rth_allowed
+from app.data.market_data import MarketDataService
 
 
 # ===== Terminalstil =====
@@ -62,6 +64,7 @@ def _fmt_qty(value):
 class IbClient:
     def __init__(self):
         self.ib = IB()
+        self.market_data = MarketDataService()
 
     async def connect(self):
         if not self.ib.isConnected():
@@ -72,6 +75,32 @@ class IbClient:
                 print(f"{_c('● CONNECT ERROR', _RED)} {e}")
         else:
             print(f"{_c('● CONNECT', _YELLOW)} IBKR already connected")
+
+    
+
+    def _get_fmp_quote(self, symbol: str):
+        q = self.market_data.get_quote(symbol) or {}
+
+        price = _to_num(q.get("price"))
+        previous_close = _to_num(q.get("previousClose"))
+
+        ref_price = price or previous_close
+        if ref_price is None:
+            return None
+
+        return {
+            "symbol": symbol,
+            "bid": None,
+            "ask": None,
+            "last": ref_price,
+            "market": ref_price,
+            "close": previous_close or ref_price,
+            "mid": ref_price,
+            "spread": None,
+            "spread_pct": None,
+            "source": "fmp",
+        }
+
 
     async def _get_reference_price(self, contract):
         price = None
@@ -217,7 +246,7 @@ class IbClient:
             print(f"{_c('● ORDER ERROR', _RED)} qualifyContracts failed for {_c(symbol, _BOLD)}: {e}")
             return None
 
-        quote = quote or await self.get_live_quote(symbol)
+        quote = quote or self._get_fmp_quote(symbol)
         ref_price = None
 
         if quote:

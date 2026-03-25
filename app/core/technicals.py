@@ -1,4 +1,4 @@
-#technucaks.py
+#thecknicals.py
 import math
 import os
 import time
@@ -9,27 +9,33 @@ from typing import Optional
 import pandas as pd
 
 from app.core.market_profile import MARKET_PROFILE
+from app.data.fmp_client import FMPClient
 
 log = logging.getLogger("technicals")
 
 _HISTORY_CACHE = {}
-_HISTORY_TTL_SEC = 60
+_HISTORY_TTL_SEC = 300
 _IB_CLIENT = None
+_FMP = None
 
-# Kända problem-/döda symboler som bara skapar Error 200 / brus i IB
 _INVALID_IB_SYMBOLS = {
     "CCIV",
     "TWTR",
     "NETE",
 }
 
-# Symboler som behöver mappas för IB-kontrakt
 _IB_SYMBOL_MAP = {
     "BRK-B": "BRK B",
 }
 
-# Undvik att spamma samma sim-logg hela tiden
 _LAST_SIM_LOG = {}
+
+
+def _get_fmp():
+    global _FMP
+    if _FMP is None:
+        _FMP = FMPClient()
+    return _FMP
 
 
 def _sim_enabled() -> bool:
@@ -51,6 +57,8 @@ def _safe_float(value, default=None):
             return default
         if isinstance(value, float) and math.isnan(value):
             return default
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
         return float(value)
     except Exception:
         return default
@@ -64,9 +72,7 @@ def _should_skip_ib_symbol(symbol: str) -> bool:
     sym = _normalize_symbol(symbol)
     if not sym:
         return True
-    if sym in _INVALID_IB_SYMBOLS:
-        return True
-    return False
+    return sym in _INVALID_IB_SYMBOLS
 
 
 def _period_to_ib_duration(period: str) -> str:
@@ -100,10 +106,7 @@ def _build_contract(symbol: str):
         return None
 
     sym = _normalize_symbol(symbol)
-    if not sym:
-        return None
-
-    if _should_skip_ib_symbol(sym):
+    if not sym or _should_skip_ib_symbol(sym):
         return None
 
     if MARKET_PROFILE == "SE":
@@ -137,12 +140,6 @@ def _bars_to_df(bars):
     if df.empty:
         return None
 
-    needed = ["Open", "High", "Low", "Close", "Volume"]
-    for col in needed:
-        if col not in df.columns:
-            df[col] = None
-
-    # Rensa bort helt trasiga rader
     df = df.dropna(subset=["Close"])
     if df.empty:
         return None
@@ -150,14 +147,182 @@ def _bars_to_df(bars):
     return df.reset_index(drop=True)
 
 
-def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d", use_ib: bool = True):
-    """
-    Hämtar historiska candles via IB.
-    Returnerar pandas DataFrame eller None.
-    Cachar kortvarigt för att minska upprepade anrop.
-    """
+def _extract_fmp_rows(raw):
+    if raw is None:
+        return []
+
+    if isinstance(raw, list):
+        return raw
+
+    if isinstance(raw, dict):
+        for key in ("historical", "data", "results"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return value
+
+    return []
+
+def _normalize_fmp_history_to_df(symbol: str, raw):
+    rows = _extract_fmp_rows(raw)
+    if not rows:
+        return None
+
+    normalized = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        date_val = row.get("date") or row.get("Date")
+
+        # FMP stable historical-price-eod/light verkar ge:
+        # {symbol, date, price, volume}
+        # så vi använder "price" som fallback för OHLC
+        price_val = (
+            row.get("price")
+            if row.get("price") is not None
+            else row.get("Price")
+        )
+
+        open_val = (
+            row.get("open")
+            if row.get("open") is not None
+            else row.get("Open")
+            if row.get("Open") is not None
+            else price_val
+        )
+        high_val = (
+            row.get("high")
+            if row.get("high") is not None
+            else row.get("High")
+            if row.get("High") is not None
+            else price_val
+        )
+        low_val = (
+            row.get("low")
+            if row.get("low") is not None
+            else row.get("Low")
+            if row.get("Low") is not None
+            else price_val
+        )
+        close_val = (
+            row.get("close")
+            if row.get("close") is not None
+            else row.get("Close")
+            if row.get("Close") is not None
+            else row.get("adjClose")
+            if row.get("adjClose") is not None
+            else row.get("adjustedClose")
+            if row.get("adjustedClose") is not None
+            else price_val
+        )
+        volume_val = (
+            row.get("volume")
+            if row.get("volume") is not None
+            else row.get("Volume")
+        )
+
+        close_num = _safe_float(close_val)
+        if close_num is None:
+            continue
+
+        open_num = _safe_float(open_val, close_num)
+        high_num = _safe_float(high_val, close_num)
+        low_num = _safe_float(low_val, close_num)
+        volume_num = _safe_float(volume_val, 0.0)
+
+        normalized.append(
+            {
+                "Date": date_val,
+                "Open": open_num,
+                "High": high_num,
+                "Low": low_num,
+                "Close": close_num,
+                "Volume": volume_num,
+            }
+        )
+
+    if not normalized:
+        return None
+
+    df = pd.DataFrame(normalized)
+    if df.empty or "Close" not in df.columns:
+        return None
+
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        return None
+
+    if "Date" in df.columns:
+        try:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date")
+        except Exception:
+            pass
+
+    return df.reset_index(drop=True)
+
+
+    if not normalized:
+        return None
+
+    df = pd.DataFrame(normalized)
+    if df.empty or "Close" not in df.columns:
+        return None
+
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        return None
+
+    if "Date" in df.columns:
+        try:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date")
+        except Exception:
+            pass
+
+    return df.reset_index(drop=True)
+
+
+def _fetch_fmp_history(symbol: str, period: str = "6mo", interval: str = "1d"):
     sym = _normalize_symbol(symbol)
-    cache_key = (sym, period, interval)
+
+    try:
+        fmp = _get_fmp()
+        raw = fmp.historical_eod_light(sym)
+        df = _normalize_fmp_history_to_df(sym, raw)
+
+        if df is None or df.empty:
+            raw_type = type(raw).__name__
+            raw_keys = list(raw.keys())[:10] if isinstance(raw, dict) else None
+            raw_preview = str(raw)[:250]
+
+            log.warning(
+                "[technicals] Ingen användbar FMP-historik för %s | raw_type=%s | raw_keys=%s | raw_preview=%s",
+                sym,
+                raw_type,
+                raw_keys,
+                raw_preview,
+            )
+            return None
+
+        if len(df) < 60:
+            log.warning(
+                "[technicals] För kort FMP-historik för %s | rows=%d",
+                sym,
+                len(df),
+            )
+            return None
+
+        return df
+
+    except Exception as e:
+        log.warning("[technicals] FMP historical fail för %s: %s", sym, e)
+        return None
+
+def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d", use_ib: bool = False):
+    sym = _normalize_symbol(symbol)
+    cache_key = (sym, period, interval, use_ib)
     now = time.time()
 
     cached = _HISTORY_CACHE.get(cache_key)
@@ -166,60 +331,37 @@ def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d", 
         if now - ts < _HISTORY_TTL_SEC:
             return df
 
+    df = None
 
-    if not use_ib:
-        _HISTORY_CACHE[cache_key] = (now, None)
-        return None
+    if use_ib:
+        if not _should_skip_ib_symbol(sym) and _IB_CLIENT is not None and getattr(_IB_CLIENT, "ib", None):
+            try:
+                ib = _IB_CLIENT.ib
+                if ib.isConnected():
+                    contract = _build_contract(sym)
+                    if contract is not None:
+                        duration_str = _period_to_ib_duration(period)
+                        bar_size = _interval_to_ib_bar_size(interval)
 
+                        bars = ib.reqHistoricalData(
+                            contract,
+                            endDateTime="",
+                            durationStr=duration_str,
+                            barSizeSetting=bar_size,
+                            whatToShow="TRADES",
+                            useRTH=True,
+                            formatDate=1,
+                            keepUpToDate=False,
+                        )
+                        df = _bars_to_df(bars)
+            except Exception as e:
+                log.warning("[technicals] IB historical fail för %s: %s", sym, e)
 
-    if _should_skip_ib_symbol(sym):
-        _HISTORY_CACHE[cache_key] = (now, None)
-        return None
+    if df is None or df.empty:
+        df = _fetch_fmp_history(sym, period=period, interval=interval)
 
-    if _IB_CLIENT is None or not getattr(_IB_CLIENT, "ib", None):
-        log.warning("[technicals] IB client saknas för %s", sym)
-        _HISTORY_CACHE[cache_key] = (now, None)
-        return None
-
-    try:
-        ib = _IB_CLIENT.ib
-        if not ib.isConnected():
-            log.warning("[technicals] IB ej ansluten för %s", sym)
-            _HISTORY_CACHE[cache_key] = (now, None)
-            return None
-
-        contract = _build_contract(sym)
-        if contract is None:
-            _HISTORY_CACHE[cache_key] = (now, None)
-            return None
-
-        duration_str = _period_to_ib_duration(period)
-        bar_size = _interval_to_ib_bar_size(interval)
-
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime="",
-            durationStr=duration_str,
-            barSizeSetting=bar_size,
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-            keepUpToDate=False,
-        )
-
-        df = _bars_to_df(bars)
-        if df is None or df.empty:
-            log.warning("[technicals] Ingen IB-prisdata för %s", sym)
-            _HISTORY_CACHE[cache_key] = (now, None)
-            return None
-
-        _HISTORY_CACHE[cache_key] = (now, df)
-        return df
-
-    except Exception as e:
-        log.warning("[technicals] IB historical fail för %s: %s", sym, e)
-        _HISTORY_CACHE[cache_key] = (now, None)
-        return None
+    _HISTORY_CACHE[cache_key] = (now, df)
+    return df
 
 
 def compute_sma(series, window: int) -> Optional[float]:
@@ -314,6 +456,7 @@ def _log_sim_once(symbol: str, profile: str, price):
     if os.getenv("DEBUG_SIM_TECHNICALS", "0").strip().lower() in {"1", "true", "yes", "on"}:
         log.info("[technicals] Simulerar technicals för %s med profil %s, pris ~%s", symbol, profile, price)
 
+
 def _apply_simulation(symbol: str, technicals: dict) -> dict:
     t = deepcopy(technicals or {})
     profile = _sim_profile()
@@ -327,7 +470,6 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
     momentum_60 = _safe_float(t.get("momentum_60"))
     atr_pct = _safe_float(t.get("atr_pct"))
 
-    # Om ingen riktig price finns, simulera inte fram skräp
     if price is None:
         return t
 
@@ -370,18 +512,11 @@ def _apply_simulation(symbol: str, technicals: dict) -> dict:
         if volume_ratio is not None:
             t["volume_ratio"] = max(1.1, volume_ratio)
 
-    elif profile == "flat":
-        pass
-
     _log_sim_once(symbol, profile, t.get("price"))
     return t
 
 
-def build_technical_snapshot(symbol: str, use_ib: bool = True):
-    """
-    Returnerar technicals-dict för symbolen.
-    Returnerar alltid en dict, aldrig {}.
-    """
+def build_technical_snapshot(symbol: str, use_ib: bool = False):
     sym = _normalize_symbol(symbol)
     if not sym:
         return _empty_snapshot()

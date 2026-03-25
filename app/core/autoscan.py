@@ -1,3 +1,4 @@
+#autoscan.py
 import asyncio
 import json
 import logging
@@ -299,12 +300,6 @@ def _build_by_sym(universe: list[dict]) -> dict:
         stock["symbol"] = sym
         stock["name"] = s.get("name") or stock.get("name") or sym
 
-        stock["_pipeline_signal"] = s.get("signal")
-        stock["_pipeline_final_score"] = s.get("final_score")
-        stock["_pipeline_technicals"] = s.get("technicals") or {}
-        stock["_pipeline_scores"] = s.get("scores") or {}
-        stock["_pipeline_score_details"] = s.get("score_details") or {}
-
         stock["_pipeline_candidate_score"] = s.get("candidate_score", s.get("final_score", 0))
         stock["_pipeline_entry_score"] = s.get("entry_score", 0)
         stock["_pipeline_candidate_quality"] = s.get("candidate_quality", "C")
@@ -317,6 +312,36 @@ def _build_by_sym(universe: list[dict]) -> dict:
         stock["_pipeline_retention_score"] = s.get("retention_score", s.get("final_score", 0))
         stock["_pipeline_replacement_score"] = s.get("replacement_score", s.get("final_score", 0))
         stock["_pipeline_rank"] = s.get("rank")
+
+        # Vanliga alias-fält för autoscan_scan.py bucket-funktioner
+        stock["signal"] = s.get("signal")
+        stock["final_score"] = s.get("final_score", 0)
+
+        stock["candidate_score"] = s.get("candidate_score", s.get("final_score", 0))
+        stock["entry_score"] = s.get("entry_score", 0)
+        stock["candidate_quality"] = s.get("candidate_quality", "C")
+        stock["setup_type"] = s.get("setup_type", "unknown")
+        stock["timing_state"] = s.get("timing_state", "unknown")
+        stock["action"] = s.get("action", "watch")
+        stock["positive_flags"] = s.get("positive_flags") or []
+        stock["risk_flags"] = s.get("risk_flags") or []
+        stock["entry_reasons"] = s.get("entry_reasons") or []
+        stock["retention_score"] = s.get("retention_score", s.get("final_score", 0))
+        stock["replacement_score"] = s.get("replacement_score", s.get("final_score", 0))
+        stock["rank"] = s.get("rank")
+
+        pipeline_technicals = s.get("technicals") or {}
+
+        stock["_pipeline_technicals"] = pipeline_technicals
+        stock["technicals"] = pipeline_technicals
+        stock["scores"] = s.get("scores") or {}
+        stock["score_details"] = s.get("score_details") or {}
+
+        if not to_float(stock.get("latestClose"), None):
+            stock["latestClose"] = to_float(
+                pipeline_technicals.get("price"),
+                0.0,
+            )
 
         by_sym[sym] = stock
 
@@ -871,11 +896,42 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         if is_affordable(by_sym.get(s) or {}, auto_qty, max_order_value)
     ]
 
-    non_tradable_entry_candidates = [s for s in entry_candidates if s not in tradable_entry_candidates]
+    non_tradable_entry_candidates = [
+        s for s in entry_candidates if s not in tradable_entry_candidates
+    ]
+
+    log.info(
+        "[autoscan] CANDIDATE FILTER | all=%d | entry=%d | tradable_entry=%d | non_tradable_entry=%d | watch=%d | fallback=%d",
+        len(all_candidates),
+        len(entry_candidates),
+        len(tradable_entry_candidates),
+        len(non_tradable_entry_candidates),
+        len(watch_candidates),
+        len(fallback_candidates),
+    )
+
+    for s in non_tradable_entry_candidates[:20]:
+        stock = by_sym.get(s) or {}
+        price = to_float(stock.get("latestClose"), 0) or to_float(
+            ((stock.get("_pipeline_technicals") or {}).get("price")),
+            0,
+        )
+        est_value = (price or 0) * auto_qty
+        log.info(
+            "[autoscan] ENTRY BLOCKED | %s | price=%.2f | qty=%s | est=%.2f | max=%.2f",
+            s,
+            price or 0.0,
+            auto_qty,
+            est_value,
+            max_order_value,
+        )
 
     for s in non_tradable_entry_candidates[:10]:
         stock = by_sym.get(s) or {}
-        price = to_float(stock.get("latestClose"), 0) or to_float(((stock.get("_pipeline_technicals") or {}).get("price")), 0)
+        price = to_float(stock.get("latestClose"), 0) or to_float(
+            ((stock.get("_pipeline_technicals") or {}).get("price")),
+            0,
+        )
         est_value = (price or 0) * auto_qty
         debug_log(
             log,
@@ -892,6 +948,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         + watch_candidates
         + fallback_candidates
     )
+
+    if not candidate_source and all_candidates:
+        log.warning(
+            "[autoscan] candidate_source became empty after affordability/filtering. "
+            "Falling back to raw entry/watch/fallback candidates."
+        )
+        candidate_source = dedupe_keep_order(
+            entry_candidates
+            + watch_candidates
+            + fallback_candidates
+        )
+            
+  
 
     all_candidates = dedupe_keep_order(all_candidates)
 
@@ -914,8 +983,28 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     )
 
     prev_uni = [s.upper() for s in state.get("universe", []) if s]
-    scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, candidate_source, state)
-    scan_set = dedupe_keep_order(scan_set)[:universe_rows]
+
+    if not candidate_source:
+        log.warning(
+            "[autoscan] candidate_source empty - keeping previous universe this pass"
+        )
+        scan_set = dedupe_keep_order(
+            [s for s in prev_uni if s in by_sym]
+        )[:universe_rows]
+        dropped_pre = []
+        added_pre = []
+    else:
+        scan_set, dropped_pre, added_pre = rotate_universe(prev_uni, candidate_source, state)
+        scan_set = dedupe_keep_order(scan_set)[:universe_rows]
+
+    log.info(
+    "[autoscan] ROTATE RESULT | prev=%d | candidate_source=%d | scan_after_rotate=%d | dropped_pre=%d | added_pre=%d",
+        len(prev_uni),
+        len(candidate_source),
+        len(scan_set),
+        len(dropped_pre),
+        len(added_pre),
+    )
 
     def _available_replacements(current_scan, banned=None):
         pool, reason_counts = available_replacements(
@@ -1723,9 +1812,16 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     if len(scan_set) < universe_rows:
         log.warning(
-            "[autoscan] Universe could not be fully filled (%d/%d). Candidates missing after filter/exclude.",
+            "[autoscan] Universe could not be fully filled (%d/%d). "
+            "candidate_source=%d | entry=%d | tradable_entry=%d | watch=%d | fallback=%d | replacements=%d",
             len(scan_set),
             universe_rows,
+            len(candidate_source),
+            len(entry_candidates),
+            len(tradable_entry_candidates),
+            len(watch_candidates),
+            len(fallback_candidates),
+            len(replacement_source),
         )
 
     state["universe"] = list(scan_set)

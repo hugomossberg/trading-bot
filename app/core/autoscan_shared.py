@@ -1,3 +1,4 @@
+#autoscan_shared.py
 from datetime import datetime, timezone
 
 
@@ -74,28 +75,28 @@ def build_pipeline_analysis(stock: dict) -> dict:
     stock = stock or {}
     sym = (stock.get("symbol") or "").upper().strip()
 
-    pipeline_signal = stock.get("_pipeline_signal") or "Håll"
-    pipeline_score = stock.get("_pipeline_final_score", 0)
-    pipeline_technicals = stock.get("_pipeline_technicals") or {}
-    pipeline_scores = stock.get("_pipeline_scores") or {}
-    pipeline_score_details = stock.get("_pipeline_score_details") or {}
+    pipeline_signal = stock.get("_pipeline_signal", stock.get("signal", "Håll"))
+    pipeline_score = stock.get("_pipeline_final_score", stock.get("final_score", 0))
+    pipeline_technicals = stock.get("_pipeline_technicals", stock.get("technicals", {})) or {}
+    pipeline_scores = stock.get("_pipeline_scores", stock.get("scores", {})) or {}
+    pipeline_score_details = stock.get("_pipeline_score_details", stock.get("score_details", {})) or {}
 
     return {
         "symbol": sym,
         "signal": pipeline_signal,
         "total_score": pipeline_score,
-        "candidate_score": stock.get("_pipeline_candidate_score", pipeline_score),
-        "entry_score": stock.get("_pipeline_entry_score", 0),
-        "candidate_quality": stock.get("_pipeline_candidate_quality", "C"),
-        "setup_type": stock.get("_pipeline_setup_type", "unknown"),
-        "timing_state": stock.get("_pipeline_timing_state", "unknown"),
-        "action": stock.get("_pipeline_action", "watch"),
-        "positive_flags": stock.get("_pipeline_positive_flags") or [],
-        "risk_flags": stock.get("_pipeline_risk_flags") or [],
-        "entry_reasons": stock.get("_pipeline_entry_reasons") or [],
-        "retention_score": stock.get("_pipeline_retention_score", pipeline_score),
-        "replacement_score": stock.get("_pipeline_replacement_score", pipeline_score),
-        "rank": stock.get("_pipeline_rank"),
+        "candidate_score": stock.get("_pipeline_candidate_score", stock.get("candidate_score", pipeline_score)),
+        "entry_score": stock.get("_pipeline_entry_score", stock.get("entry_score", 0)),
+        "candidate_quality": stock.get("_pipeline_candidate_quality", stock.get("candidate_quality", "C")),
+        "setup_type": stock.get("_pipeline_setup_type", stock.get("setup_type", "unknown")),
+        "timing_state": stock.get("_pipeline_timing_state", stock.get("timing_state", "unknown")),
+        "action": stock.get("_pipeline_action", stock.get("action", "watch")),
+        "positive_flags": stock.get("_pipeline_positive_flags", stock.get("positive_flags", [])) or [],
+        "risk_flags": stock.get("_pipeline_risk_flags", stock.get("risk_flags", [])) or [],
+        "entry_reasons": stock.get("_pipeline_entry_reasons", stock.get("entry_reasons", [])) or [],
+        "retention_score": stock.get("_pipeline_retention_score", stock.get("retention_score", pipeline_score)),
+        "replacement_score": stock.get("_pipeline_replacement_score", stock.get("replacement_score", pipeline_score)),
+        "rank": stock.get("_pipeline_rank", stock.get("rank")),
         "raw_technicals": pipeline_technicals,
         "pipeline_scores": pipeline_scores,
         "pipeline_score_details": pipeline_score_details,

@@ -1,4 +1,3 @@
-#pipeline.py
 import json
 import logging
 import os
@@ -6,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.logview import debug_log
-
 from app.config import (
     FINAL_CANDIDATES_PATH,
     PIPELINE_SNAPSHOT_PATH,
@@ -16,12 +14,9 @@ from app.config import (
 from app.core.scanner import ensure_stock_info
 from app.core.technicals import build_technical_snapshot
 from app.core.filters import precheck_stock
-
 from app.data.market_data import MarketDataService
-
 from app.core.candidate_profile import build_candidate_profile
 from app.core.entry_engine import evaluate_entry
-
 from app.core.scoring import (
     score_price_trend,
     score_rsi,
@@ -38,8 +33,23 @@ from app.core.scoring import (
 log = logging.getLogger("pipeline")
 md = MarketDataService()
 
+
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = os.getenv(key, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
 
 
 def _to_float(x, default=None):
@@ -50,10 +60,32 @@ def _to_float(x, default=None):
     except Exception:
         return default
 
+
+def _technicals_ready(technicals: dict) -> bool:
+    if not isinstance(technicals, dict):
+        return False
+
+    required = (
+        "price",
+        "sma20",
+        "sma50",
+        "rsi14",
+        "atr14",
+        "momentum_20",
+    )
+
+    for key in required:
+        if _to_float(technicals.get(key), None) is None:
+            return False
+
+    return True
+
+
 def _write_json(path, data):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def _normalize_stock(stock: dict) -> dict:
     stock = dict(stock or {})
@@ -75,7 +107,7 @@ def _stage1_score(stock: dict, technicals: dict) -> tuple[int, dict]:
     return total, details
 
 
-def _run_stage1(universe: list[dict]) -> list[dict]:
+def _run_stage1(universe: list[dict], use_ib: bool = False) -> list[dict]:
     results = []
 
     for raw in universe:
@@ -84,12 +116,40 @@ def _run_stage1(universe: list[dict]) -> list[dict]:
         if not symbol:
             continue
 
-        technicals = build_technical_snapshot(symbol, use_ib=False) or {}
-        filters = precheck_stock(stock, technicals)
+        try:
+            technicals = build_technical_snapshot(symbol, use_ib=use_ib) or {}
+        except Exception as e:
+            log.warning("[pipeline] TECH %-6s | snapshot fail: %s", symbol, e)
+            technicals = {}
 
-        score, score_details = _stage1_score(stock, technicals)
+        technicals_ok = _technicals_ready(technicals)
 
-        passed = filters.get("allowed", False) and score >= 0
+        if technicals_ok:
+            filters = precheck_stock(stock, technicals)
+            score, score_details = _stage1_score(stock, technicals)
+        else:
+            filters = {
+                "allowed": False,
+                "reason": "missing_technicals",
+            }
+            score = -1
+            score_details = {
+                "price_trend": 0,
+                "rsi": 0,
+                "volume_spike": 0,
+                "volatility": 0,
+                "momentum": 0,
+                "liquidity": 0,
+            }
+
+        passed = technicals_ok and filters.get("allowed", False) and score >= 0
+
+        if passed:
+            reason = "passed"
+        elif not technicals_ok:
+            reason = "missing_technicals"
+        else:
+            reason = "filtered_or_low_score"
 
         results.append({
             "symbol": symbol,
@@ -97,7 +157,7 @@ def _run_stage1(universe: list[dict]) -> list[dict]:
             "stage": 1,
             "passed": passed,
             "score": score,
-            "reason": "passed" if passed else "filtered_or_low_score",
+            "reason": reason,
             "filters": filters,
             "score_details": score_details,
             "stock": stock,
@@ -106,6 +166,8 @@ def _run_stage1(universe: list[dict]) -> list[dict]:
 
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results
+        
+
 
 def _stage2_score(stock: dict) -> tuple[int, dict]:
     details = {
@@ -144,53 +206,63 @@ def _run_stage2(stage1_passed: list[dict]) -> list[dict]:
 
     results.sort(
         key=lambda x: (x.get("stage1_score", 0) + x.get("score", 0)),
-        reverse=True
+        reverse=True,
     )
     return results
+
 
 def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
     results = []
 
-    news_fetch_limit = 20
-    try:
-        news_fetch_limit = int(os.getenv("PIPELINE_NEWS_FETCH_LIMIT", "20"))
-    except Exception:
-        news_fetch_limit = 20
-
-    news_items_limit = 5
-    try:
-        news_items_limit = int(os.getenv("PIPELINE_NEWS_ITEMS", "5"))
-    except Exception:
-        news_items_limit = 5
+    news_fetch_limit = _env_int("PIPELINE_NEWS_FETCH_LIMIT", 20)
+    news_items_limit = _env_int("PIPELINE_NEWS_ITEMS", 5)
+    min_news_score = _env_int("PIPELINE_STAGE3_MIN_NEWS_SCORE", 0)
+    require_news = _env_bool("PIPELINE_STAGE3_REQUIRE_NEWS", False)
 
     for idx, item in enumerate(stage2_passed, start=1):
         stock = dict(item.get("stock") or {})
         symbol = item.get("symbol")
 
-        if idx <= news_fetch_limit:
+        news_items = []
+
+        if idx <= news_fetch_limit and news_fetch_limit > 0 and news_items_limit > 0:
             try:
                 news_items = md.get_stock_news(symbol, limit=news_items_limit) or []
-                stock["News"] = [
-                    {
-                        "content": {
-                            "title": n.get("title", ""),
-                            "summary": n.get("text", "") or "",
-                            "publisher": n.get("publisher") or n.get("site", ""),
-                            "link": n.get("url", ""),
-                        }
-                    }
-                    for n in news_items
-                ]
             except Exception as e:
                 log.warning("[pipeline] NEWS %-6s | fetch fail: %s", symbol, e)
-                stock["News"] = []
-        else:
-            stock["News"] = []
+                news_items = []
+
+        stock["News"] = [
+            {
+                "content": {
+                    "title": n.get("title", ""),
+                    "summary": n.get("text", "") or "",
+                    "publisher": n.get("publisher") or n.get("site", ""),
+                    "link": n.get("url", ""),
+                }
+            }
+            for n in news_items
+        ]
 
         news_score, raw_sentiment = score_news(stock)
+        news_count = len(stock.get("News", []))
+
+        if require_news and news_count == 0:
+            passed = False
+            reason = "no_news"
+        elif news_score < min_news_score:
+            passed = False
+            reason = f"news_score_below_min:{news_score}"
+        else:
+            passed = True
+            reason = "passed"
+
         score_details = {
             "news_sentiment_score": news_score,
             "raw_sentiment": raw_sentiment,
+            "news_count": news_count,
+            "min_news_score": min_news_score,
+            "require_news": require_news,
         }
 
         if stock.get("News"):
@@ -200,21 +272,21 @@ def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
             ]
             debug_log(
                 log,
-                "[pipeline][NEWS] %-6s | items=%d | score=%+d | %s",
+                "[pipeline][NEWS] %-6s | items=%d | score=%+d | passed=%s | %s",
                 symbol,
-                len(stock.get("News", [])),
+                news_count,
                 news_score,
+                passed,
                 " || ".join(top_titles),
             )
         else:
             debug_log(
                 log,
-                "[pipeline][NEWS] %-6s | items=0 | score=%+d",
+                "[pipeline][NEWS] %-6s | items=0 | score=%+d | passed=%s",
                 symbol,
                 news_score,
+                passed,
             )
-
-        passed = True
 
         results.append({
             "symbol": symbol,
@@ -222,7 +294,7 @@ def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
             "stage": 3,
             "passed": passed,
             "score": news_score,
-            "reason": "passed",
+            "reason": reason,
             "score_details": score_details,
             "stock": stock,
             "technicals": item.get("technicals") or {},
@@ -234,13 +306,13 @@ def _run_stage3(stage2_passed: list[dict]) -> list[dict]:
 
     results.sort(
         key=lambda x: (
-            x.get("stage1_score", 0)
-            + x.get("stage2_score", 0)
-            + x.get("score", 0)
+            int(x.get("passed", False)),
+            x.get("stage1_score", 0) + x.get("stage2_score", 0) + x.get("score", 0),
         ),
-        reverse=True
+        reverse=True,
     )
     return results
+
 
 def _action_priority(action: str) -> int:
     order = {
@@ -325,7 +397,6 @@ def _build_final_candidates(stage3_passed: list[dict], limit: int = 10) -> list[
         })
 
     final_candidates.sort(
-
         key=lambda x: (
             _action_priority(x.get("action")),
             int(x.get("entry_score", 0) or 0),
@@ -340,37 +411,29 @@ def _build_final_candidates(stage3_passed: list[dict], limit: int = 10) -> list[
 
     return final_candidates
 
+
 async def run_pipeline(ib_client) -> dict:
     rows_target = max(UNIVERSE_ROWS * CANDIDATE_MULTIPLIER, UNIVERSE_ROWS)
+    use_ib_technicals = _env_bool("PIPELINE_USE_IB_TECHNICALS", False)
 
     universe = await ensure_stock_info(ib_client, min_count=rows_target)
     universe = universe or []
 
-    stage1 = _run_stage1(universe)
+    stage1 = _run_stage1(universe, use_ib=use_ib_technicals)
     stage1_passed = [x for x in stage1 if x.get("passed")]
 
-    stage2_limit = max(UNIVERSE_ROWS * 4, 120)
-    try:
-        stage2_limit = int(os.getenv("PIPELINE_STAGE2_LIMIT", str(stage2_limit)))
-    except Exception:
-        pass
-
+    stage2_limit = _env_int("PIPELINE_STAGE2_LIMIT", max(UNIVERSE_ROWS * 4, 120))
     stage2 = _run_stage2(stage1_passed[:stage2_limit])
     stage2_passed = [x for x in stage2 if x.get("passed")]
 
-    stage3_limit = max(UNIVERSE_ROWS * 4, 120)
-    try:
-        stage3_limit = int(os.getenv("PIPELINE_STAGE3_LIMIT", str(stage3_limit)))
-    except Exception:
-        pass
-
+    stage3_limit = _env_int("PIPELINE_STAGE3_LIMIT", max(UNIVERSE_ROWS * 4, 120))
     stage3_input = stage2_passed[:stage3_limit]
     stage3 = _run_stage3(stage3_input)
     stage3_passed = [x for x in stage3 if x.get("passed")]
 
     final_candidates = _build_final_candidates(
         stage3_passed,
-        limit=max(UNIVERSE_ROWS * 4, 100)
+        limit=max(UNIVERSE_ROWS * 4, 100),
     )
 
     snapshot = {
@@ -392,14 +455,13 @@ async def run_pipeline(ib_client) -> dict:
     _write_json(FINAL_CANDIDATES_PATH, final_candidates)
 
     log.info(
-        "[pipeline] done | universe=%d | s1=%d | s2=%d | s3=%d | final=%d",
+        "[pipeline] done | universe=%d | s1=%d | s2=%d | s3=%d | final=%d | ib_technicals=%s",
         len(universe),
         len(stage1_passed),
         len(stage2_passed),
         len(stage3_passed),
         len(final_candidates),
+        use_ib_technicals,
     )
 
     return snapshot
-
-    

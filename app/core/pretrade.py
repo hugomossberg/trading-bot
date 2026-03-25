@@ -1,7 +1,10 @@
-#pretrade
 import os
 
 from app.core.autoscan_shared import to_float
+from app.data.market_data import MarketDataService
+
+
+_md = MarketDataService()
 
 
 def _env_float(key: str, default: float) -> float:
@@ -9,6 +12,32 @@ def _env_float(key: str, default: float) -> float:
         return float(os.getenv(key, str(default)))
     except Exception:
         return default
+
+
+def _get_fmp_quote(symbol: str) -> dict | None:
+    q = _md.get_quote(symbol) or {}
+
+    price = to_float(q.get("price"), 0)
+    previous_close = to_float(q.get("previousClose"), 0)
+    volume = to_float(q.get("volume"), None)
+
+    ref_price = price or previous_close
+    if not ref_price or ref_price <= 0:
+        return None
+
+    return {
+        "symbol": symbol,
+        "bid": None,
+        "ask": None,
+        "last": ref_price,
+        "market": ref_price,
+        "close": previous_close or ref_price,
+        "mid": ref_price,
+        "spread": None,
+        "spread_pct": None,
+        "volume": volume,
+        "source": "fmp",
+    }
 
 
 async def validate_pretrade_buy(
@@ -35,9 +64,9 @@ async def validate_pretrade_buy(
     atr_pct = to_float(raw_technicals.get("atr_pct"), None)
     volume_ratio = to_float(raw_technicals.get("volume_ratio"), None)
 
-    quote = await ib_client.get_live_quote(symbol)
+    quote = _get_fmp_quote(symbol)
     if not quote:
-        return {"ok": False, "reason": "no_ib_quote"}
+        return {"ok": False, "reason": "no_fmp_quote"}
 
     bid = quote.get("bid")
     ask = quote.get("ask")
@@ -51,7 +80,8 @@ async def validate_pretrade_buy(
     if not live_price or live_price <= 0:
         return {"ok": False, "reason": "no_live_price", "quote": quote}
 
-    require_bid_ask = os.getenv("PRETRADE_REQUIRE_BID_ASK", "1").strip().lower() in {
+    # FMP har normalt inte riktig bid/ask, så default ska vara AV här
+    require_bid_ask = os.getenv("PRETRADE_REQUIRE_BID_ASK", "0").strip().lower() in {
         "1", "true", "yes", "on"
     }
 
