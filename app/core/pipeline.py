@@ -413,16 +413,21 @@ def _build_final_candidates(stage3_passed: list[dict], limit: int = 10) -> list[
 
 
 async def run_pipeline(ib_client) -> dict:
-    rows_target = max(UNIVERSE_ROWS * CANDIDATE_MULTIPLIER, UNIVERSE_ROWS)
+    rows_target = _env_int("SCANNER_MIN_USABLE_ROWS", max(UNIVERSE_ROWS * CANDIDATE_MULTIPLIER, UNIVERSE_ROWS))
     use_ib_technicals = _env_bool("PIPELINE_USE_IB_TECHNICALS", False)
+
+    stage1_limit = _env_int("PIPELINE_STAGE1_LIMIT", 1200)
+    stage2_limit = _env_int("PIPELINE_STAGE2_LIMIT", 500)
+    stage3_limit = _env_int("PIPELINE_STAGE3_LIMIT", 250)
+    final_limit = _env_int("PIPELINE_FINAL_LIMIT", 175)
 
     universe = await ensure_stock_info(ib_client, min_count=rows_target)
     universe = universe or []
 
-    stage1 = _run_stage1(universe, use_ib=use_ib_technicals)
+    stage1_input = universe[:stage1_limit]
+    stage1 = _run_stage1(stage1_input, use_ib=use_ib_technicals)
     stage1_passed = [x for x in stage1 if x.get("passed")]
 
-    stage2_limit = _env_int("PIPELINE_STAGE2_LIMIT", max(UNIVERSE_ROWS * 4, 120))
     stage2 = _run_stage2(stage1_passed[:stage2_limit])
     stage2_passed = [x for x in stage2 if x.get("passed")]
 
@@ -433,9 +438,8 @@ async def run_pipeline(ib_client) -> dict:
 
     final_candidates = _build_final_candidates(
         stage3_passed,
-        limit=max(UNIVERSE_ROWS * 4, 100),
+        limit=final_limit,
     )
-
     snapshot = {
         "generated_at": _now_iso(),
         "universe_size": len(universe),

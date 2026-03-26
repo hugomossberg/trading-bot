@@ -1,4 +1,5 @@
 #autoscan.py
+from pathlib import Path
 import asyncio
 import json
 import logging
@@ -14,7 +15,9 @@ from app.config import (
     SIGNAL_LOG_PATH,
     SUMMARY_NOTIFS,
     UNIVERSE_ROWS,
+    REBUILD_LOCK_PATH,
 )
+
 from app.core.autoscan_owned import (
     advance_long_exit_state,
     build_owned_decision_state,
@@ -124,6 +127,13 @@ def _env_int(key: str, default: int) -> int:
         return int(raw)
     except Exception:
         return default
+
+
+def _rebuild_lock_active() -> bool:
+    try:
+        return Path(REBUILD_LOCK_PATH).exists()
+    except Exception:
+        return False
 
 
 def trim_jsonl(path: str, keep_last: int = 5000):
@@ -402,6 +412,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     )
 
     if not autoscan_enabled:
+        return
+
+    if _rebuild_lock_active():
+        log.warning("[autoscan] Stock_info rebuild pågår - skippar denna 2-minuterskörning.")
         return
 
     if not ib_client or not ib_client.ib.isConnected():

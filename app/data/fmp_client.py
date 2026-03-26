@@ -1,11 +1,13 @@
-# fmp_client.py
 import os
 import time
+import logging
 import requests
+from collections import Counter, deque
 from typing import Any
 from dotenv import load_dotenv
 
 load_dotenv()
+log = logging.getLogger("fmp")
 
 
 class FMPClient:
@@ -33,11 +35,78 @@ class FMPClient:
 
         self._last_request_ts = 0.0
 
+        # Live usage monitor
+        self._usage_window = deque()   # [(timestamp, endpoint_name), ...]
+        self._usage_log_every_sec = 5.0
+        self._last_usage_log_ts = 0.0
+        self._warn_soft = 240
+        self._warn_hard = 280
+        self._usage_limit_per_min = 300
+
     def _respect_min_interval(self):
         now = time.time()
         elapsed = now - self._last_request_ts
         if elapsed < self.min_interval_sec:
             time.sleep(self.min_interval_sec - elapsed)
+
+
+    def _endpoint_label(self, path: str) -> str:
+        path = (path or "").strip("/").lower()
+
+        if path in {"quote", "quote-short", "batch-quote", "batch-quote-short", "aftermarket-quote", "batch-aftermarket-quote"}:
+            return "quote"
+        if path == "profile":
+            return "profile"
+        if path in {"key-metrics-ttm", "ratios-ttm"}:
+            return "fundamentals"
+        if path in {"financial-growth", "ratios", "financial-scores", "key-metrics", "income-statement"}:
+            return "financials"
+        if path.startswith("news/"):
+            return "news"
+        if path == "company-screener":
+            return "screener"
+        if path.startswith("historical-chart") or path.startswith("historical-price-eod"):
+            return "history"
+
+        return path
+
+    def _usage_prune(self, now: float) -> None:
+        cutoff = now - 60.0
+        while self._usage_window and self._usage_window[0][0] < cutoff:
+            self._usage_window.popleft()
+
+    def _usage_record(self, path: str, now: float | None = None) -> None:
+        now = now or time.time()
+        endpoint = self._endpoint_label(path)
+
+        self._usage_window.append((now, endpoint))
+        self._usage_prune(now)
+
+        # logga inte exakt varje request, bara ibland
+        if now - self._last_usage_log_ts < self._usage_log_every_sec:
+            return
+
+        self._last_usage_log_ts = now
+
+        counts = Counter(endpoint_name for _, endpoint_name in self._usage_window)
+        total = len(self._usage_window)
+
+        parts = []
+        for key in ("quote", "profile", "fundamentals", "financials", "news", "screener", "history"):
+            if counts.get(key):
+                parts.append(f"{key}={counts[key]}")
+
+        msg = f"last_60s={total}/{self._usage_limit_per_min}"
+        if parts:
+            msg += " | " + " | ".join(parts)
+
+        if total >= self._warn_hard:
+            log.warning("[FMP-HARD] %s", msg)
+        elif total >= self._warn_soft:
+            log.warning("[FMP-WARN] %s", msg)
+        else:
+            log.info("[FMP] %s", msg)
+    
 
     def _get(self, path: str, **params) -> Any:
         url = f"{self.BASE_URL}/{path.lstrip('/')}"
@@ -48,8 +117,11 @@ class FMPClient:
             self._respect_min_interval()
 
             try:
+
                 r = self.session.get(url, params=params, timeout=self.timeout)
-                self._last_request_ts = time.time()
+                now = time.time()
+                self._last_request_ts = now
+                self._usage_record(path, now=now)
 
                 # 429 / 5xx -> retry med backoff
                 if r.status_code == 429 or 500 <= r.status_code < 600:

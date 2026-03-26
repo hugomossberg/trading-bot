@@ -50,6 +50,10 @@ STOCK_INFO_PATH = Path(os.getenv("STOCK_INFO_PATH", str(STATE_DIR / "stock_info.
 PIPELINE_SNAPSHOT_PATH = Path(os.getenv("PIPELINE_SNAPSHOT_PATH", str(STATE_DIR / "pipeline_snapshot.json")))
 FINAL_CANDIDATES_PATH = Path(os.getenv("FINAL_CANDIDATES_PATH", str(STATE_DIR / "final_candidates.json")))
 
+REBUILD_LOCK_PATH = Path(
+    os.getenv("REBUILD_LOCK_PATH", str(STATE_DIR / "stock_info_rebuild.lock"))
+)
+
 # ===== Env config =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")

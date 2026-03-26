@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.config import STOCK_INFO_PATH
+from app.config import STOCK_INFO_PATH, REBUILD_LOCK_PATH
 from app.core.market_profile import PROFILE, MARKET_PROFILE
 from app.data.market_data import MarketDataService
 
@@ -77,6 +77,26 @@ def _read_stock_info() -> list[dict] | None:
         return data if isinstance(data, list) else None
     except Exception:
         return None
+
+
+def _set_rebuild_lock() -> None:
+    path = Path(REBUILD_LOCK_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+
+
+def _clear_rebuild_lock() -> None:
+    path = Path(REBUILD_LOCK_PATH)
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _rebuild_lock_active() -> bool:
+    path = Path(REBUILD_LOCK_PATH)
+    return path.exists()
 
 
 def _built_today(path: str) -> bool:
@@ -395,15 +415,21 @@ async def refresh_stock_info(ib_client=None, limit: int = 50) -> list[dict]:
     return rows
 
 
+
 async def rebuild_stock_info_for_premarket(ib_client=None, limit: int = 50) -> list[dict]:
     """
     Daglig rebuild före öppning.
     Bygger alltid när premarket-jobbet körs.
+    Låser rebuild så att autoscan inte lägger sig i.
     """
     log.info("[scanner] Premarket rebuild start")
-    data = await refresh_stock_info(ib_client=ib_client, limit=limit)
-    log.info("[scanner] Premarket rebuild done | rows=%d", len(data or []))
-    return data or []
+    _set_rebuild_lock()
+    try:
+        data = await refresh_stock_info(ib_client=ib_client, limit=limit)
+        log.info("[scanner] Premarket rebuild done | rows=%d", len(data or []))
+        return data or []
+    finally:
+        _clear_rebuild_lock()
 
 
 async def ensure_stock_info(ib_client=None, min_count: int = 10) -> list[dict]:
@@ -434,6 +460,10 @@ async def ensure_stock_info(ib_client=None, min_count: int = 10) -> list[dict]:
         current_rows,
         minimum_usable,
     )
+
+    if _rebuild_lock_active():
+        log.warning("[scanner] Rebuild-lock aktiv - autoscan gör ingen fallback rebuild.")
+        return data or []
 
     data = await refresh_stock_info(ib_client=ib_client, limit=min_count)
     ok, reason = _is_valid_stock_info(data, minimum_usable)
