@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from app.config import (
     AUTO_QTY,
@@ -160,11 +160,22 @@ def trim_jsonl(path: str, keep_last: int = 5000):
             f.writelines(lines[-keep_last:])
 
 
-async def _trade_has_fill(trade, wait_sec: float = 8.0, poll_sec: float = 0.25) -> bool:
+def _get_trade_filled_qty(trade) -> int:
     if not trade:
-        return False
+        return 0
+
+    try:
+        return int(float(trade.orderStatus.filled or 0))
+    except Exception:
+        return 0
+
+
+async def _wait_for_trade_fill_qty(trade, wait_sec: float = 8.0, poll_sec: float = 0.25) -> int:
+    if not trade:
+        return 0
 
     loops = max(1, int(wait_sec / poll_sec))
+    last_filled = 0
 
     for _ in range(loops):
         try:
@@ -173,26 +184,21 @@ async def _trade_has_fill(trade, wait_sec: float = 8.0, poll_sec: float = 0.25) 
             status = ""
 
         try:
-            filled = float(trade.orderStatus.filled or 0)
+            filled = int(float(trade.orderStatus.filled or 0))
         except Exception:
-            filled = 0.0
+            filled = 0
 
-        if filled > 0:
-            return True
+        last_filled = max(last_filled, filled)
 
         if status in {"filled"}:
-            return True
+            return last_filled
 
         if status in {"cancelled", "inactive", "api cancelled"}:
-            return False
+            return last_filled
 
         await asyncio.sleep(poll_sec)
 
-    try:
-        return float(trade.orderStatus.filled or 0) > 0
-    except Exception:
-        return False
-
+    return max(last_filled, _get_trade_filled_qty(trade))
 
 
 def _minutes_since_regular_open(market_info: dict) -> int | None:
@@ -211,6 +217,25 @@ def _minutes_since_regular_open(market_info: dict) -> int | None:
     except Exception:
         return None
 
+    
+def get_trading_day_bucket(market_info: dict) -> str:
+    now_market = market_info.get("now_market")
+    if not now_market:
+        return now_utc().date().isoformat()
+
+    market_dt = now_market
+    open_minutes = 9 * 60 + 30
+    minutes_now = market_dt.hour * 60 + market_dt.minute
+
+    # Före börsöppning = räkna fortfarande som föregående handelsdag
+    if minutes_now < open_minutes:
+        market_dt = market_dt - timedelta(days=1)
+
+    # Backa över helg tills vardag
+    while market_dt.weekday() >= 5:  # 5=lördag, 6=söndag
+        market_dt = market_dt - timedelta(days=1)
+
+    return market_dt.date().isoformat()
 
 async def _execute_order_safe(
     ib_client,
@@ -541,7 +566,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         open_sell_syms = set()
 
     state = ensure_state_defaults(load_state())
-    today = now_utc().date().isoformat()
 
     by_sym = _build_by_sym(universe)
     analysis_cache = build_analysis_cache(by_sym)
@@ -554,6 +578,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         getattr(ib_client, "pnl_unrealized_open", 0.0),
     )
     market_info = get_market_session_info()
+    today = get_trading_day_bucket(market_info)
+
     market_ok = bool(market_info["market_open"])
     regular_market_ok = market_info["phase"] == "regular"
     sim_mode = sim_market
@@ -692,7 +718,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 elif missing_count >= 6:
                     pressure = "warning"
                     effective_signal = "Håll"
-                    exit_mode = "watch"
+                    exit_mode = "soft"
                     owned_reason = "missing_from_pipeline_exit_soon"
                 elif missing_count >= 3:
                     pressure = "warning"
@@ -957,9 +983,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             if trade:
                 remember_order_key(state, key)
-                filled_ok = await _trade_has_fill(trade)
+                filled_qty = await _wait_for_trade_fill_qty(trade)
 
-                if filled_ok:
+                if filled_qty > 0:
                     persist_signal = True
 
                     if order_side == "Sälj":
@@ -974,14 +1000,14 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
                     mark_trade_timestamp(state, sym)
                     set_exclude_minutes(state, sym, exclude_bought_min)
-                    new_pos = _sync_local_fill_state(sym, order_side, qty)
+                    new_pos = _sync_local_fill_state(sym, order_side, filled_qty)
 
                     if order_side == "Sälj" and new_pos <= 0:
                         _remove_portfolio_review(sym)
 
                     owned_orders_for_report.append(
-                        f"OWNED {report_label} submitted: {sym} x{qty} "
-                        f"(exit_mode={exit_mode}, reason={owned_reason}, stage={exit_state.get('stage')}, source={analysis.get('data_source')})"
+                        f"OWNED {report_label} filled: {sym} x{filled_qty} "
+                        f"(requested={qty}, exit_mode={exit_mode}, reason={owned_reason}, stage={exit_state.get('stage')}, source={analysis.get('data_source')})"
                     )
 
                     append_event(
@@ -989,7 +1015,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                         symbol=sym,
                         name=raw.get("name") or raw.get("companyName") or sym,
                         data={
-                            "qty": qty,
+                            "qty": filled_qty,
+                            "requested_qty": qty,
                             "exit_mode": exit_mode,
                             "exit_reason": owned_reason,
                             "exit_stage": exit_state.get("stage"),
@@ -1168,7 +1195,10 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             "[autoscan] candidate_source empty - keeping previous universe this pass"
         )
         scan_set = dedupe_keep_order(
-            [s for s in prev_uni if s in by_sym]
+        [
+            s for s in prev_uni
+            if s in by_sym and is_affordable(by_sym.get(s) or {}, auto_qty, max_order_value)
+        ]
         )[:universe_rows]
         dropped_pre = []
         added_pre = []
@@ -1880,7 +1910,18 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     update_signal=False,
                 )
                 continue
-            
+
+            if action_signal == "Köp" and sym in open_buy_syms:
+                log.info("[SKIP] %s → open buy order already exists", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
 
             if action_signal == "Köp" and current_pos > 0 and not ALLOW_ADD_TO_EXISTING:
                 log.info("[SKIP] %s → add-to-existing disabled", sym)
@@ -1893,7 +1934,6 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     update_signal=False,
                 )
                 continue
-
 
             if action_signal == "Köp" and opening_buy_lock_active:
                 log.info(
@@ -2086,9 +2126,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
             if trade:
                 remember_order_key(state, key)
-                filled_ok = await _trade_has_fill(trade)
+                filled_qty = await _wait_for_trade_fill_qty(trade)
 
-                if filled_ok:
+                if filled_qty > 0:
                     persist_signal = True
 
                     if action_signal == "Köp":
@@ -2096,33 +2136,33 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                         orders_buy += 1
                         increment_day_counter(state, "buys_today", sym, today)
 
-                        log_signal_line(log, "BUY", sym, qty, raw_technicals.get("price"), analysis.get("total_score"))
+                        log_signal_line(log, "BUY", sym, filled_qty, raw_technicals.get("price"), analysis.get("total_score"))
 
-                        orders_for_report.append(f"BUY filled: {sym} x{qty}")
+                        orders_for_report.append(f"BUY filled: {sym} x{filled_qty} (requested={qty})")
                         append_event(
                             "buy_filled",
                             symbol=sym,
                             name=raw.get("name") or raw.get("companyName") or sym,
-                            data={"qty": qty},
+                            data={"qty": filled_qty, "requested_qty": qty},
                         )
 
                     elif action_signal == "Sälj":
                         orders_sell += 1
                         increment_day_counter(state, "sells_today", sym, today)
 
-                        log_signal_line(log, "EXIT", sym, qty, raw_technicals.get("price"), analysis.get("total_score"))
+                        log_signal_line(log, "EXIT", sym, filled_qty, raw_technicals.get("price"), analysis.get("total_score"))
 
-                        orders_for_report.append(f"SELL filled: {sym} x{qty}")
+                        orders_for_report.append(f"SELL filled: {sym} x{filled_qty} (requested={qty})")
                         append_event(
                             "sell_filled",
                             symbol=sym,
                             name=raw.get("name") or raw.get("companyName") or sym,
-                            data={"qty": qty},
+                            data={"qty": filled_qty, "requested_qty": qty},
                         )
 
                     mark_trade_timestamp(state, sym)
                     set_exclude_minutes(state, sym, exclude_bought_min)
-                    new_pos = _sync_local_fill_state(sym, action_signal, qty)
+                    new_pos = _sync_local_fill_state(sym, action_signal, filled_qty)
 
                     if action_signal == "Köp":
                         new_owned_row = build_owned_review_row(
