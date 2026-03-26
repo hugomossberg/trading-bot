@@ -236,23 +236,29 @@ def evaluate_entry(
         action = "avoid"
 
     elif (
-        entry_score >= 8
-        and candidate_quality in {"A+", "A", "B"}
+        entry_score >= 9
+        and candidate_quality in {"A+", "A"}
         and price > sma20
         and sma20 >= sma50
     ):
         timing_state = "ready"
         action = "buy_ready"
 
-    elif entry_score >= 7 and candidate_quality in {"A+", "A", "B"}:
+    elif (
+        entry_score >= 7
+        and candidate_quality in {"A+", "A", "B"}
+    ):
         timing_state = "almost_ready"
         action = "watch"
 
-    elif entry_score >= 3:
+    elif (
+        entry_score >= 4
+        and candidate_quality in {"A+", "A", "B"}
+    ):
         timing_state = "watch_only"
         action = "hold_candidate"
 
-    elif entry_score >= -1:
+    elif entry_score >= 1:
         timing_state = "watch_only"
         action = "watch"
 

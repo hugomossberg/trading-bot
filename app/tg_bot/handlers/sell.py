@@ -17,18 +17,18 @@ def is_us_market_open(now_et=None) -> bool:
 async def sell_all(update, context):
     ib_client = context.application.bot_data.get("ib")
     if not ib_client:
-        return await update.message.reply_text("Ingen IB-klient i bot_data.")
+        return await update.message.reply_text("IB client missing in bot_data.")
 
     ib = ib_client.ib
     if not ib.isConnected():
-        return await update.message.reply_text("IB ej ansluten.")
+        return await update.message.reply_text("IB not connected.")
 
     is_open = is_us_market_open()
 
     try:
         positions = await ib.reqPositionsAsync()
     except Exception as e:
-        return await update.message.reply_text(f"Kunde inte läsa positioner: {e}")
+        return await update.message.reply_text(f"Could not read positions: {e}")
 
     sent = []
     skipped = []
@@ -39,7 +39,7 @@ async def sell_all(update, context):
             continue
 
         if not float(abs(qty)).is_integer():
-            skipped.append(f"• {p.contract.symbol}: fractional {abs(qty)}")
+            skipped.append(f"{p.contract.symbol} fractional {abs(qty)}")
             continue
 
         action = "SELL" if qty > 0 else "BUY"
@@ -54,35 +54,37 @@ async def sell_all(update, context):
             contract = p.contract
             contract.exchange = "SMART"
             ib.placeOrder(contract, order)
-            sent.append(f"• {contract.symbol} {action} {int(abs(qty))}")
+            sent.append(f"{contract.symbol} {action} {int(abs(qty))}")
         except Exception as e:
-            skipped.append(f"• {p.contract.symbol}: {e}")
+            skipped.append(f"{p.contract.symbol} {e}")
 
     if not sent and not skipped:
-        return await update.message.reply_text("Inga positioner att stänga.")
+        return await update.message.reply_text("No positions to close.")
 
-    msg = []
+    parts = ["CLOSE ALL"]
+
     if sent:
-        msg.append("📤 Skickade stängningsorder:\n" + "\n".join(sent))
-    if skipped:
-        msg.append("⚠️ Skippade:\n" + "\n".join(skipped))
+        parts.append("Sent\n" + "\n".join(sent))
 
-    await update.message.reply_text("\n\n".join(msg))
+    if skipped:
+        parts.append("Skipped\n" + "\n".join(skipped))
+
+    await update.message.reply_text("\n\n".join(parts))
 
 
 async def sell_one(update, context, symbol: str, qty: int | None = None):
     ib_client = context.application.bot_data.get("ib")
     if not ib_client:
-        return await update.message.reply_text("Ingen IB-klient i bot_data.")
+        return await update.message.reply_text("IB client missing in bot_data.")
 
     ib = ib_client.ib
     if not ib.isConnected():
-        return await update.message.reply_text("IB ej ansluten.")
+        return await update.message.reply_text("IB not connected.")
 
     try:
         positions = await ib.reqPositionsAsync()
     except Exception as e:
-        return await update.message.reply_text(f"Kunde inte läsa positioner: {e}")
+        return await update.message.reply_text(f"Could not read positions: {e}")
 
     pos = None
     for p in positions:
@@ -91,23 +93,38 @@ async def sell_one(update, context, symbol: str, qty: int | None = None):
             break
 
     if not pos:
-        return await update.message.reply_text(f"Hittade ingen öppen position i {symbol}.")
+        return await update.message.reply_text(f"No open position found in {symbol}.")
 
     current_qty = float(pos.position or 0.0)
 
     if not float(abs(current_qty)).is_integer():
         return await update.message.reply_text(
-            f"{symbol} har fractional position ({current_qty}), sälj manuellt i TWS."
+            f"{symbol} has a fractional position ({current_qty}). Sell manually in TWS."
         )
 
+    is_open = is_us_market_open()
     sell_qty = int(abs(current_qty)) if qty is None else min(int(abs(current_qty)), qty)
     action = "SELL" if current_qty > 0 else "BUY"
     order = MarketOrder(action, sell_qty)
 
     try:
+        order.outsideRth = False if is_open else True
+    except Exception:
+        pass
+
+    try:
         contract = pos.contract
         contract.exchange = "SMART"
         ib.placeOrder(contract, order)
-        return await update.message.reply_text(f"📤 Skickade order: {action} {sell_qty} {symbol}")
+
+        msg = (
+            "ORDER SENT\n\n"
+            f"Symbol: {symbol}\n"
+            f"Action: {action}\n"
+            f"Quantity: {sell_qty}\n"
+            f"Session: {'RTH' if is_open else 'AH'}"
+        )
+        return await update.message.reply_text(msg)
+
     except Exception as e:
-        return await update.message.reply_text(f"Kunde inte sälja {symbol}: {e}")
+        return await update.message.reply_text(f"Could not sell {symbol}: {e}")

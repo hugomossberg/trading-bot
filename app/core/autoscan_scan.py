@@ -12,9 +12,9 @@ def candidate_bucket(stock: dict) -> str | None:
 
     if (
         action == "buy_ready"
-        and quality in {"A+", "A", "B"}
-        and entry_score >= 5
-        and total_score >= 3
+        and quality in {"A+", "A"}
+        and entry_score >= 7
+        and total_score >= 5
     ):
         return "entry"
 
@@ -47,9 +47,9 @@ def replacement_bucket(stock: dict) -> str | None:
     # Lite bredare än scan-bucket men fortfarande inte skräp
     if (
         action == "buy_ready"
-        and quality in {"A+", "A", "B", "C"}
-        and replacement_score >= 3
-        and entry_score >= 1
+        and quality in {"A+", "A"}
+        and replacement_score >= 5
+        and entry_score >= 6
     ):
         return "upgrade"
 
@@ -226,10 +226,10 @@ def _replacement_profile(analysis: dict) -> str:
     # Stark replacement
     if (
         action == "buy_ready"
-        and q_rank >= 2
-        and replacement_score >= 3
-        and entry_score >= 1
-        and total_score >= 1
+        and q_rank >= 4
+        and replacement_score >= 5
+        and entry_score >= 6
+        and total_score >= 5
     ):
         return "upgrade"
 

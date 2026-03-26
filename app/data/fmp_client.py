@@ -37,18 +37,19 @@ class FMPClient:
 
         # Live usage monitor
         self._usage_window = deque()   # [(timestamp, endpoint_name), ...]
-        self._usage_log_every_sec = 5.0
+        self._usage_log_every_sec = 60.0
         self._last_usage_log_ts = 0.0
         self._warn_soft = 240
-        self._warn_hard = 280
+        self._warn_hard = 270
         self._usage_limit_per_min = 300
+        self._last_usage_level = "normal"
+        self._last_usage_total = 0
 
     def _respect_min_interval(self):
         now = time.time()
         elapsed = now - self._last_request_ts
         if elapsed < self.min_interval_sec:
             time.sleep(self.min_interval_sec - elapsed)
-
 
     def _endpoint_label(self, path: str) -> str:
         path = (path or "").strip("/").lower()
@@ -75,6 +76,13 @@ class FMPClient:
         while self._usage_window and self._usage_window[0][0] < cutoff:
             self._usage_window.popleft()
 
+    def _usage_level(self, total: int) -> str:
+        if total >= self._warn_hard:
+            return "hard"
+        if total >= self._warn_soft:
+            return "warn"
+        return "normal"
+
     def _usage_record(self, path: str, now: float | None = None) -> None:
         now = now or time.time()
         endpoint = self._endpoint_label(path)
@@ -82,14 +90,9 @@ class FMPClient:
         self._usage_window.append((now, endpoint))
         self._usage_prune(now)
 
-        # logga inte exakt varje request, bara ibland
-        if now - self._last_usage_log_ts < self._usage_log_every_sec:
-            return
-
-        self._last_usage_log_ts = now
-
         counts = Counter(endpoint_name for _, endpoint_name in self._usage_window)
         total = len(self._usage_window)
+        level = self._usage_level(total)
 
         parts = []
         for key in ("quote", "profile", "fundamentals", "financials", "news", "screener", "history"):
@@ -100,13 +103,26 @@ class FMPClient:
         if parts:
             msg += " | " + " | ".join(parts)
 
-        if total >= self._warn_hard:
+        level_changed = level != self._last_usage_level
+        crossed_hard = total >= self._warn_hard and self._last_usage_total < self._warn_hard
+        minute_elapsed = (now - self._last_usage_log_ts) >= self._usage_log_every_sec
+
+        should_log = minute_elapsed or level_changed or crossed_hard
+
+        if not should_log:
+            self._last_usage_total = total
+            return
+
+        self._last_usage_log_ts = now
+        self._last_usage_level = level
+        self._last_usage_total = total
+
+        if level == "hard":
             log.warning("[FMP-HARD] %s", msg)
-        elif total >= self._warn_soft:
+        elif level == "warn":
             log.warning("[FMP-WARN] %s", msg)
         else:
             log.info("[FMP] %s", msg)
-    
 
     def _get(self, path: str, **params) -> Any:
         url = f"{self.BASE_URL}/{path.lstrip('/')}"
@@ -117,13 +133,11 @@ class FMPClient:
             self._respect_min_interval()
 
             try:
-
                 r = self.session.get(url, params=params, timeout=self.timeout)
                 now = time.time()
                 self._last_request_ts = now
                 self._usage_record(path, now=now)
 
-                # 429 / 5xx -> retry med backoff
                 if r.status_code == 429 or 500 <= r.status_code < 600:
                     wait = self.backoff_base ** attempt
                     if attempt < self.max_retries:

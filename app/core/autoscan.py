@@ -16,8 +16,9 @@ from app.config import (
     SUMMARY_NOTIFS,
     UNIVERSE_ROWS,
     REBUILD_LOCK_PATH,
+    NO_BUY_FIRST_MINUTES_AFTER_OPEN,
+    ALLOW_ADD_TO_EXISTING,
 )
-
 from app.core.autoscan_owned import (
     advance_long_exit_state,
     build_owned_decision_state,
@@ -181,6 +182,24 @@ async def _trade_has_fill(trade, wait_sec: float = 8.0, poll_sec: float = 0.25) 
         return float(trade.orderStatus.filled or 0) > 0
     except Exception:
         return False
+
+
+
+def _minutes_since_regular_open(market_info: dict) -> int | None:
+    if not market_info:
+        return None
+
+    if str(market_info.get("phase") or "").strip().lower() != "regular":
+        return None
+
+    now_market = market_info.get("now_market")
+    if not now_market:
+        return None
+
+    try:
+        return (now_market.hour * 60 + now_market.minute) - (9 * 60 + 30)
+    except Exception:
+        return None
 
 
 async def _execute_order_safe(
@@ -489,6 +508,15 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     market_ok = bool(market_info["market_open"])
     regular_market_ok = market_info["phase"] == "regular"
     sim_mode = sim_market
+
+
+
+    minutes_since_open = _minutes_since_regular_open(market_info)
+    opening_buy_lock_active = (
+        regular_market_ok
+        and minutes_since_open is not None
+        and minutes_since_open < NO_BUY_FIRST_MINUTES_AFTER_OPEN
+    )
 
     log.info("[market] %s", market_status_text_sv())
 
@@ -1712,6 +1740,39 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     update_signal=False,
                 )
                 continue
+            
+
+            if action_signal == "Köp" and current_pos > 0 and not ALLOW_ADD_TO_EXISTING:
+                log.info("[SKIP] %s → add-to-existing disabled", sym)
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
+
+            if action_signal == "Köp" and opening_buy_lock_active:
+                log.info(
+                    "[SKIP] %s → opening lock active (%s/%s min after open)",
+                    sym,
+                    minutes_since_open,
+                    NO_BUY_FIRST_MINUTES_AFTER_OPEN,
+                )
+                _apply_symbol_state(
+                    state,
+                    sym,
+                    curr_decision,
+                    effective_signal,
+                    removed_this_pass,
+                    update_signal=False,
+                )
+                continue
+
+
 
             if action_signal == "Köp" and entries_this_pass >= max_new_entries_per_pass:
                 log.info("[SKIP] %s → MAX_NEW_ENTRIES_PER_PASS reached", sym)
@@ -1864,9 +1925,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
                         log_signal_line(log, "BUY", sym, qty, raw_technicals.get("price"), analysis.get("total_score"))
 
-                        orders_for_report.append(f"BUY submitted: {sym} x{qty}")
+                        orders_for_report.append(f"BUY filled: {sym} x{qty}")
                         append_event(
-                            "buy_submitted",
+                            "buy_filled",
                             symbol=sym,
                             name=raw.get("name") or raw.get("companyName") or sym,
                             data={"qty": qty},
@@ -1878,9 +1939,9 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
                         log_signal_line(log, "EXIT", sym, qty, raw_technicals.get("price"), analysis.get("total_score"))
 
-                        orders_for_report.append(f"SELL submitted: {sym} x{qty}")
+                        orders_for_report.append(f"SELL filled: {sym} x{qty}")
                         append_event(
-                            "sell_submitted",
+                            "sell_filled",
                             symbol=sym,
                             name=raw.get("name") or raw.get("companyName") or sym,
                             data={"qty": qty},
