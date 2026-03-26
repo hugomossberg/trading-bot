@@ -1,3 +1,4 @@
+#premarket.py
 import json
 import os
 import logging
@@ -9,6 +10,7 @@ from app.core.scanner import rebuild_stock_info_for_premarket
 from app.core.signals import get_signal_analysis
 from app.core.helpers import send_long_message
 from app.data.fmp_client import FMPClient
+from app.core.pipeline import run_pipeline
 
 log = logging.getLogger("premarket")
 
@@ -36,7 +38,7 @@ def _normalize_stock(stock: dict) -> dict:
     s["trailingEps"] = _to_float(s.get("trailingEps"), 0.0)
     s["dividendYield"] = _to_float(s.get("dividendYield"), 0.0)
     return s
-import os
+
 
 def _fetch_fmp_snapshot(ticker: str) -> dict:
     quote = fmp.quote_short(ticker) or {}
@@ -86,12 +88,29 @@ async def run_premarket_scan(bot, ib_client, admin_chat_id: int, want_ai: bool =
                 admin_chat_id,
                 f"Premarket: stock_info rebuild klar ({len(built)} rows)."
             )
+
     except Exception as e:
         log.exception("Premarket rebuild fail")
         if bot and admin_chat_id:
             await bot.send_message(
                 admin_chat_id,
                 f"Premarket: stock_info rebuild misslyckades ({e})."
+            )
+
+    try:
+        snapshot = await run_pipeline(ib_client)
+        final_count = len(snapshot.get("final_candidates", []) or [])
+        if bot and admin_chat_id:
+            await bot.send_message(
+                admin_chat_id,
+                f"Premarket pipeline done: {final_count} final candidates."
+            )
+    except Exception as e:
+        log.exception("Premarket pipeline failed: %s", e)
+        if bot and admin_chat_id:
+            await bot.send_message(
+                admin_chat_id,
+                f"Premarket pipeline failed: {e}"
             )
 
     if not ib_client or not ib_client.ib.isConnected():

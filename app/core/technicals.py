@@ -14,7 +14,7 @@ from app.data.fmp_client import FMPClient
 log = logging.getLogger("technicals")
 
 _HISTORY_CACHE = {}
-_HISTORY_TTL_SEC = 300
+_HISTORY_TTL_SEC = 1800
 _IB_CLIENT = None
 _FMP = None
 

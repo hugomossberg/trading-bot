@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 from app.config import (
     AUTO_QTY,
@@ -135,6 +136,15 @@ def _rebuild_lock_active() -> bool:
         return Path(REBUILD_LOCK_PATH).exists()
     except Exception:
         return False
+
+def _file_age_seconds(path: str) -> float | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return datetime.now(timezone.utc).timestamp() - p.stat().st_mtime
+    except Exception:
+        return None
 
 
 def trim_jsonl(path: str, keep_last: int = 5000):
@@ -443,11 +453,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
         log.warning("IB not connected - autoscan aborted.")
         return
 
-    try:
-        pipeline_snapshot = await run_pipeline(ib_client)
-    except Exception as e:
-        log.error("[autoscan] Failed to run pipeline: %s", e)
-        return
+    pipeline_snapshot = {}
+
+    pipeline_max_age = _env_int("PIPELINE_MAX_AGE_SECONDS", 900)
+    age = _file_age_seconds(FINAL_CANDIDATES_PATH)
+    need_pipeline = age is None or age > pipeline_max_age
+
+    if need_pipeline:
+        log.info("[autoscan] FINAL_CANDIDATES stale/missing -> rebuild pipeline once")
+        try:
+            pipeline_snapshot = await run_pipeline(ib_client)
+        except Exception as e:
+            log.error("[autoscan] Failed to refresh pipeline: %s", e)
+            return
 
     try:
         with open(FINAL_CANDIDATES_PATH, "r", encoding="utf-8") as f:
@@ -455,6 +473,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     except Exception as e:
         log.error("[autoscan] Failed to read %s: %s", FINAL_CANDIDATES_PATH, e)
         return
+
+    if not isinstance(pipeline_snapshot, dict):
+        pipeline_snapshot = {}
+
+    if not pipeline_snapshot:
+        pipeline_snapshot = {
+            "universe_size": len(universe),
+            "stage1_passed": 0,
+            "stage2_passed": 0,
+            "stage3_passed": 0,
+            "final_candidates": universe,
+        }
+
 
     positions = await ib_client.ib.reqPositionsAsync()
     held = {

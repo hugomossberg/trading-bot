@@ -14,7 +14,7 @@ from app.config import (
 from app.core.scanner import ensure_stock_info
 from app.core.technicals import build_technical_snapshot
 from app.core.filters import precheck_stock
-from app.data.market_data import MarketDataService
+from app.data.market_data_shared import md
 from app.core.candidate_profile import build_candidate_profile
 from app.core.entry_engine import evaluate_entry
 from app.core.scoring import (
@@ -31,7 +31,7 @@ from app.core.scoring import (
 )
 
 log = logging.getLogger("pipeline")
-md = MarketDataService()
+
 
 
 def _now_iso():

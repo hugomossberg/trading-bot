@@ -7,10 +7,10 @@ from pathlib import Path
 
 from app.config import STOCK_INFO_PATH, REBUILD_LOCK_PATH
 from app.core.market_profile import PROFILE, MARKET_PROFILE
-from app.data.market_data import MarketDataService
+from app.data.market_data_shared import md
 
 log = logging.getLogger("scanner")
-md = MarketDataService()
+
 
 _BAD_IB_SYMBOLS = {
     "CCIV",

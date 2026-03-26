@@ -6,6 +6,7 @@ from telegram.ext import Application
 
 from app.core.autoscan import run_autoscan_once
 from app.jobs.premarket import run_premarket_scan
+from app.jobs.pipeline_refresh import run_pipeline_refresh
 
 log = logging.getLogger("jobs")
 SE_TZ = ZoneInfo("Europe/Stockholm")
@@ -32,6 +33,7 @@ def premarket_schedule_text_sv(hour_et: int = 9, minute_et: int = 10) -> str:
 
 def setup_jobs(app: Application, ib_client):
     every_min = _env_int("REFRESH_MINUTES", 2)
+    pipeline_every_min = _env_int("PIPELINE_REFRESH_MINUTES", 15)
 
     app.job_queue.run_repeating(
         lambda ctx: run_autoscan_once(
@@ -49,6 +51,23 @@ def setup_jobs(app: Application, ib_client):
         },
     )
     log.info("Autoscan scheduled every %d minutes.", every_min)
+
+    app.job_queue.run_repeating(
+        lambda ctx: run_pipeline_refresh(
+            app.bot,
+            ib_client,
+            int(os.getenv("ADMIN_CHAT_ID", "0") or "0"),
+        ),
+        interval=pipeline_every_min * 60,
+        first=20,
+        name="pipeline_refresh_job",
+        job_kwargs={
+            "misfire_grace_time": 60,
+            "max_instances": 1,
+            "coalesce": True,
+        },
+    )
+    log.info("Pipeline refresh scheduled every %d minutes.", pipeline_every_min)
 
     et_str = os.getenv("PREMARKET_ET", "09:10")
     try:
