@@ -460,12 +460,8 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
     need_pipeline = age is None or age > pipeline_max_age
 
     if need_pipeline:
-        log.info("[autoscan] FINAL_CANDIDATES stale/missing -> rebuild pipeline once")
-        try:
-            pipeline_snapshot = await run_pipeline(ib_client)
-        except Exception as e:
-            log.error("[autoscan] Failed to refresh pipeline: %s", e)
-            return
+        log.warning("[autoscan] FINAL_CANDIDATES stale/missing -> skippar pass, väntar på pipeline_refresh")
+        return
 
     try:
         with open(FINAL_CANDIDATES_PATH, "r", encoding="utf-8") as f:
@@ -496,10 +492,11 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
     try:
         await ib_client.ib.reqOpenOrdersAsync()
+        open_trades = list(ib_client.ib.openTrades())
 
         open_buy_syms = {
             (t.contract.symbol or "").upper()
-            for t in ib_client.ib.openTrades()
+            for t in open_trades
             if (t.order.action or "").upper() == "BUY"
             and (t.orderStatus.status or "").lower() in {
                 "presubmitted",
@@ -510,7 +507,7 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
         open_sell_syms = {
             (t.contract.symbol or "").upper()
-            for t in ib_client.ib.openTrades()
+            for t in open_trades
             if (t.order.action or "").upper() == "SELL"
             and (t.orderStatus.status or "").lower() in {
                 "presubmitted",
@@ -518,7 +515,28 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 "pendingsubmit",
             }
         }
-    except Exception:
+
+        log.info(
+            "[OPEN ORDERS DEBUG] buys=%s | sells=%s",
+            sorted(list(open_buy_syms)),
+            sorted(list(open_sell_syms)),
+        )
+
+        for t in open_trades:
+            try:
+                log.info(
+                    "[OPEN TRADE RAW] sym=%s | action=%s | status=%s | filled=%s | remaining=%s",
+                    (t.contract.symbol or "").upper(),
+                    (t.order.action or "").upper(),
+                    str(t.orderStatus.status or "").lower(),
+                    t.orderStatus.filled,
+                    t.orderStatus.remaining,
+                )
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.error("[OPEN ORDERS DEBUG ERROR] %s", e)
         open_buy_syms = set()
         open_sell_syms = set()
 
@@ -1262,6 +1280,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             timing_state = str(analysis.get("timing_state") or "unknown")
             action = str(analysis.get("action") or "watch")
             current_pos = float(held.get(sym, 0.0))
+            entry_score = int(analysis.get("entry_score", 0) or 0)
+
+            if action == "buy_ready":
+                log.info(
+                    "[ENTRY CHECK] %s | action=%s | timing=%s | entry_score=%s | final_score=%s | quality=%s | held=%s",
+                    sym,
+                    action,
+                    timing_state,
+                    entry_score,
+                    score,
+                    candidate_quality,
+                    current_pos,
+                )
 
             effective_signal = "Håll"
             if action == "buy_ready":
@@ -1631,6 +1662,11 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             continue
 
         if only_trade_on_signal_change and prev_decision.get("signal") == effective_signal:
+            log.info(
+                "[SKIP] %s → unchanged signal (%s)",
+                sym,
+                effective_signal,
+            )
             _apply_symbol_state(
                 state,
                 sym,
@@ -1686,7 +1722,15 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
             )
 
             if not pretrade.get("ok"):
-                log.info("[SKIP] %s → pretrade blocked | %s", sym, pretrade.get("reason"))
+                log.info(
+                    "[BUY BLOCKED] %s | reason=%s | action=%s | timing=%s | entry_score=%s | final_score=%s",
+                    sym,
+                    pretrade.get("reason"),
+                    action,
+                    timing_state,
+                    analysis.get("entry_score"),
+                    analysis.get("total_score"),
+                )
 
                 append_event(
                     "buy_blocked_pretrade",
@@ -1806,7 +1850,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
 
 
             if action_signal == "Köp" and entries_this_pass >= max_new_entries_per_pass:
-                log.info("[SKIP] %s → MAX_NEW_ENTRIES_PER_PASS reached", sym)
+                log.info(
+                    "[BUY BLOCKED] %s | reason=MAX_NEW_ENTRIES_PER_PASS | action=%s | timing=%s | score=%s",
+                    sym,
+                    action,
+                    timing_state,
+                    score,
+                )
                 _apply_symbol_state(
                     state,
                     sym,
@@ -1842,7 +1892,13 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 continue
 
             if action_signal == "Köp" and is_global_trade_cooldown(state, "buy", min_minutes_between_global_buys):
-                log.info("[SKIP] %s → global buy cooldown active", sym)
+                log.info(
+                    "[BUY BLOCKED] %s | reason=GLOBAL_BUY_COOLDOWN | action=%s | timing=%s | score=%s",
+                    sym,
+                    action,
+                    timing_state,
+                    score,
+                )
                 _apply_symbol_state(
                     state,
                     sym,
@@ -1854,7 +1910,15 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                 continue
 
             if action_signal == "Köp" and scan_pass_count(state, sym) < min_scan_passes_before_buy:
-                log.info("[SKIP] %s → waiting for scan maturity (%d/%d)", sym, scan_pass_count(state, sym), min_scan_passes_before_buy)
+                log.info(
+                    "[BUY BLOCKED] %s | reason=SCAN_MATURITY %d/%d | action=%s | timing=%s | score=%s",
+                    sym,
+                    scan_pass_count(state, sym),
+                    min_scan_passes_before_buy,
+                    action,
+                    timing_state,
+                    score,
+                )
                 _apply_symbol_state(
                     state,
                     sym,
@@ -1927,6 +1991,19 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                     update_signal=False,
                 )
                 continue
+
+
+            log.info(
+                "[ORDER ATTEMPT] %s | side=%s | qty=%s | price=%.2f | est_value=%.2f | action=%s | timing=%s | score=%s",
+                sym,
+                action_signal,
+                qty,
+                float(price_now or 0.0),
+                float((price_now or 0.0) * qty),
+                action,
+                timing_state,
+                score,
+            )
 
             try:
                 trade = await _execute_order_safe(
@@ -2041,7 +2118,15 @@ async def run_autoscan_once(bot, ib_client, admin_chat_id: int):
                             reason=f"replaced {sym}",
                         )
                 else:
-                    log.info("[KEEP] %s → order submitted but not filled yet, no counters/exclude/rotation", sym)
+                    log.info(
+                        "[ORDER PENDING] %s | side=%s | qty=%s | action=%s | timing=%s | score=%s",
+                        sym,
+                        action_signal,
+                        qty,
+                        action,
+                        timing_state,
+                        score,
+                    )
             else:
                 debug_log(log, "[KEEP] %s → no real order, kept in universe", sym)
 

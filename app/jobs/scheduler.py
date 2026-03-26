@@ -36,30 +36,13 @@ def setup_jobs(app: Application, ib_client):
     pipeline_every_min = _env_int("PIPELINE_REFRESH_MINUTES", 15)
 
     app.job_queue.run_repeating(
-        lambda ctx: run_autoscan_once(
-            app.bot,
-            ib_client,
-            int(os.getenv("ADMIN_CHAT_ID", "0") or "0"),
-        ),
-        interval=every_min * 60,
-        first=5,
-        name="autoscan_job",
-        job_kwargs={
-            "misfire_grace_time": 30,
-            "max_instances": 1,
-            "coalesce": True,
-        },
-    )
-    log.info("Autoscan scheduled every %d minutes.", every_min)
-
-    app.job_queue.run_repeating(
         lambda ctx: run_pipeline_refresh(
             app.bot,
             ib_client,
             int(os.getenv("ADMIN_CHAT_ID", "0") or "0"),
         ),
         interval=pipeline_every_min * 60,
-        first=20,
+        first=5,
         name="pipeline_refresh_job",
         job_kwargs={
             "misfire_grace_time": 60,
@@ -68,6 +51,23 @@ def setup_jobs(app: Application, ib_client):
         },
     )
     log.info("Pipeline refresh scheduled every %d minutes.", pipeline_every_min)
+
+    app.job_queue.run_repeating(
+        lambda ctx: run_autoscan_once(
+            app.bot,
+            ib_client,
+            int(os.getenv("ADMIN_CHAT_ID", "0") or "0"),
+        ),
+        interval=every_min * 60,
+        first=180,
+        name="autoscan_job",
+        job_kwargs={
+            "misfire_grace_time": 30,
+            "max_instances": 1,
+            "coalesce": True,
+        },
+    )
+    log.info("Autoscan scheduled every %d minutes.", every_min)
 
     et_str = os.getenv("PREMARKET_ET", "09:10")
     try:
